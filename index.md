@@ -4,6 +4,7 @@ layout: default
 
 
 GemmiMol is a web-based macromolecular viewer focused on electron density.
+It is a next-gen version of [UglygMol](https://uglymol.github.io/)
 
 It makes models and e.den. maps easy to recognize, navigate and interpret --
 for crystallographers.
@@ -29,13 +30,9 @@ Try it:
 It also has a [reciprocal space spin-off](reciprocal.html?rlp=data/rlp.csv).
 
 GemmiMol is a small (~3 KLOC) [project](https://github.com/gemmimol/gemmimol)
-forked from Nat Echols' [xtal.js](https://github.com/natechols/xtal.js/).
 The [plan](https://github.com/gemmimol/gemmimol/blob/master/TODO.md)
-is to keep it small. But if you're missing some functionality,
+is to keep it small and fast. But if you're missing some functionality,
 it won't hurt if you get in touch --
 use [Issues](https://github.com/gemmimol/gemmimol/issues)
-or [chat](https://gitter.im/ccp4/dimple)
 or [email](mailto:wojdyr@gmail.com).
 
-See the [Wiki](https://github.com/gemmimol/gemmimol/wiki)
-for more information.
