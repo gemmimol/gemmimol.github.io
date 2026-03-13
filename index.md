@@ -15,8 +15,7 @@ a quick look without downloading the data and starting Coot.
 For instance, when screening
 [Dimple](http://ccp4.github.io/dimple/) results in a synchrotron.
 Of course, for this to work, it needs to be integrated into a website
-that provides the data access
-(see the [FAQ](https://github.com/gemmimol/gemmimol/wiki) on how to do it).
+that provides the data access.
 
 Try it:
 
