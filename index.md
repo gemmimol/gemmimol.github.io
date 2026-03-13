@@ -4,7 +4,7 @@ layout: default
 
 
 GemmiMol is a web-based macromolecular viewer focused on electron density.
-It is a next-gen version of [UglygMol](https://uglymol.github.io/)
+It is a next-gen version of [UglyMol](https://uglymol.github.io/)
 
 It makes models and e.den. maps easy to recognize, navigate and interpret --
 for crystallographers.
