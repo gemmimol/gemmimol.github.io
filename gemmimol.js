@@ -1,0 +1,9314 @@
+/*!
+ * GemmiMol v0.7.2. Macromolecular Viewer for Crystallographers.
+ * Copyright 2014 Nat Echols
+ * Copyright 2016 Diamond Light Source Ltd
+ * Copyright 2016 Marcin Wojdyr
+ * Released under the MIT License.
+ */
+(function (global, factory) {
+typeof exports === 'object' && typeof module !== 'undefined' ? factory(exports) :
+typeof define === 'function' && define.amd ? define(['exports'], factory) :
+(global = typeof globalThis !== 'undefined' ? globalThis : global || self, factory(global.GM = {}));
+})(this, (function (exports) { 'use strict';
+
+var VERSION = exports.VERSION = '0.7.2';
+
+
+class UnitCell {
+  
+  
+  
+
+  constructor(a, b, c,
+              alpha, beta, gamma) {
+    if (a <= 0 || b <= 0 || c <= 0 || alpha <= 0 || beta <= 0 || gamma <= 0) {
+      throw Error('Zero or negative unit cell parameter(s).');
+    }
+    this.parameters = [a, b, c, alpha, beta, gamma];
+    const deg2rad = Math.PI / 180.0;
+    const cos_alpha = Math.cos(deg2rad * alpha);
+    const cos_beta = Math.cos(deg2rad * beta);
+    const cos_gamma = Math.cos(deg2rad * gamma);
+    const sin_alpha = Math.sin(deg2rad * alpha);
+    const sin_beta = Math.sin(deg2rad * beta);
+    const sin_gamma = Math.sin(deg2rad * gamma);
+    if (sin_alpha === 0 || sin_beta === 0 || sin_gamma === 0) {
+      throw Error('Impossible angle - N*180deg.');
+    }
+    const cos_alpha_star_sin_beta = (cos_beta * cos_gamma - cos_alpha) /
+                                    sin_gamma;
+    const cos_alpha_star = cos_alpha_star_sin_beta / sin_beta;
+    const s1rca2 = Math.sqrt(1.0 - cos_alpha_star * cos_alpha_star);
+    // The orthogonalization matrix we use is described in ITfC B p.262:
+    // "An alternative mode of orthogonalization, used by the Protein
+    // Data Bank and most programs, is to align the a1 axis of the unit
+    // cell with the Cartesian X_1 axis, and to align the a*_3 axis with the
+    // Cartesian X_3 axis."
+    //
+    // Zeros in the matrices below are kept to make matrix multiplication
+    // faster: they make extract_block() 2x (!) faster on V8 4.5.103,
+    // no difference on FF 50.
+    /* eslint-disable no-multi-spaces */
+    this.orth = [a,   b * cos_gamma,  c * cos_beta,
+                 0.0, b * sin_gamma, -c * cos_alpha_star_sin_beta,
+                 0.0, 0.0          ,  c * sin_beta * s1rca2];
+    // based on xtal.js which is based on cctbx.uctbx
+    this.frac = [
+      1.0 / a,
+      -cos_gamma / (sin_gamma * a),
+      -(cos_gamma * cos_alpha_star_sin_beta + cos_beta * sin_gamma) /
+          (sin_beta * s1rca2 * sin_gamma * a),
+      0.0,
+      1.0 / (sin_gamma * b),
+      cos_alpha_star / (s1rca2 * sin_gamma * b),
+      0.0,
+      0.0,
+      1.0 / (sin_beta * s1rca2 * c),
+    ];
+  }
+
+  fractionalize(xyz) {
+    return multiply(xyz, this.frac);
+  }
+
+  orthogonalize(xyz) {
+    return multiply(xyz, this.orth);
+  }
+}
+
+// This function is only used with matrices frac and orth, which have 3 zeros.
+// We skip these elements, but it doesn't affect performance (on FF50 and V8).
+function multiply(xyz, mat) {
+  /* eslint-disable indent, no-multi-spaces */
+  return [mat[0] * xyz[0]  + mat[1] * xyz[1]  + mat[2] * xyz[2],
+        /*mat[3] * xyz[0]*/+ mat[4] * xyz[1]  + mat[5] * xyz[2],
+        /*mat[6] * xyz[0]  + mat[7] * xyz[1]*/+ mat[8] * xyz[2]];
+}
+
+const BondType = {
+  Unspec: 0,
+  Single: 1,
+  Double: 2,
+  Triple: 3,
+  Aromatic: 4,
+  Deloc: 5,
+  Metal: 6,
+} ;
+ 
+
+function getGemmiBondData(gemmi, st,
+                          getMonomerCifs) {
+  if (typeof gemmi.BondInfo !== 'function') {
+    return Promise.resolve({
+      bond_data: null,
+      info: {
+        source: 'unavailable',
+        monomers_requested: 0,
+        monomers_loaded: 0,
+        bond_count: 0,
+      } ,
+    });
+  }
+  const bond_info = new gemmi.BondInfo();
+  const resnames = (getMonomerCifs && typeof gemmi.get_residue_names === 'function') ?
+    gemmi.get_residue_names(st).split(',').filter(Boolean) :
+    [];
+  const monomers_requested = Array.from(new Set(resnames)).length;
+  let loaded_monomers = 0;
+  const load_monomers = (resnames.length !== 0) ?
+    getMonomerCifs(resnames) :
+    Promise.resolve([]);
+  return load_monomers.then(function (cif_texts) {
+    for (const cif_text of cif_texts) {
+      bond_info.add_monomer_cif(cif_text);
+      loaded_monomers++;
+    }
+    bond_info.get_bond_lines(st);
+    const len = bond_info.bond_data_size();
+    const source = (len !== 0 ? 'gemmi' : 'fallback');
+    const info = {
+      source: source,
+      monomers_requested: monomers_requested,
+      monomers_loaded: loaded_monomers,
+      bond_count: len / 3,
+    };
+    if (loaded_monomers === 0 && len === 0) return { bond_data: null, info: info };
+    const ptr = bond_info.bond_data_ptr();
+    return {
+      bond_data: new Int32Array(gemmi.HEAPU8.buffer, ptr, len).slice(),
+      info: info,
+    };
+  }).finally(() => bond_info.delete());
+}
+
+function modelsFromGemmi(gemmi, buffer, name,
+                                getMonomerCifs) {
+  const st = gemmi.read_structure(buffer, name);
+  return getGemmiBondData(gemmi, st, getMonomerCifs).then(function (bond_result) {
+    const bond_data = bond_result.bond_data;
+    const cell = st.cell;  // TODO: check if a copy of cell is created here
+    const models = [];
+    let max_bond_atom = -1;
+    if (bond_data != null) {
+      for (let i = 0; i < bond_data.length; i += 3) {
+        max_bond_atom = Math.max(max_bond_atom, bond_data[i], bond_data[i+1]);
+      }
+    }
+    for (let i_model = 0; i_model < st.length; ++i_model) {
+      const model = st.at(i_model);
+      const m = new Model();
+      m.source_model_index = i_model;
+      m.unit_cell = new UnitCell(cell.a, cell.b, cell.c, cell.alpha, cell.beta, cell.gamma);
+      let atom_i_seq = 0;
+      for (let i_chain = 0; i_chain < model.length; ++i_chain) {
+        const chain = model.at(i_chain);
+        const chain_name = chain.name;
+        for (let i_res = 0; i_res < chain.length; ++i_res) {
+          const res = chain.at(i_res);
+          const seqid = res.seqid_string;
+          const resname = res.name;
+          const ent_type = res.entity_type_string;
+          const is_ligand = (ent_type === 'non-polymer' || ent_type === 'branched');
+          for (let i_atom = 0; i_atom < res.length; ++i_atom) {
+            const atom = res.at(i_atom);
+            const new_atom = new Atom();
+            new_atom.i_seq = atom_i_seq++;
+            new_atom.chain = chain_name;
+            new_atom.chain_index = i_chain + 1;
+            new_atom.resname = resname;
+            new_atom.seqid = seqid;
+            new_atom.name = atom.name;
+            new_atom.altloc = atom.altloc === 0 ? '' : String.fromCharCode(atom.altloc);
+            new_atom.xyz = atom.pos;
+            new_atom.occ = atom.occ;
+            new_atom.b = atom.b_iso;
+            new_atom.element = atom.element_uname;
+            new_atom.is_ligand = is_ligand;
+            m.atoms.push(new_atom);
+          }
+        }
+      }
+      m.calculate_bounds();
+      if (i_model === 0 && bond_data != null && max_bond_atom < m.atoms.length) {
+        m.apply_bond_data(bond_data);
+      } else {
+        m.calculate_connectivity();
+      }
+      models.push(m);
+    }
+    //console.log("[after modelsFromGemmi] wasm mem:", gemmi.HEAPU8.length / 1024, "kb");
+    return { models: models, bonding: bond_result.info, structure: st };
+  }, function (err) {
+    st.delete();
+    throw err;
+  });
+}
+
+class Model {
+  
+  
+  
+  
+  
+  
+  
+  
+
+  constructor() {
+    this.atoms = [];
+    this.unit_cell = null;
+    this.has_hydrogens = false;
+    this.lower_bound = [0, 0, 0];
+    this.upper_bound = [0, 0, 0];
+    this.residue_map = null;
+    this.cubes = null;
+    this.source_model_index = null;
+  }
+
+  calculate_bounds() {
+    const lower = this.lower_bound = [Infinity, Infinity, Infinity];
+    const upper = this.upper_bound = [-Infinity, -Infinity, -Infinity];
+    for (let i = 0; i < this.atoms.length; i++) {
+      const atom = this.atoms[i];
+      for (let j = 0; j < 3; j++) {
+        const v = atom.xyz[j];
+        if (v < lower[j]) lower[j] = v;
+        if (v > upper[j]) upper[j] = v;
+      }
+    }
+    // with a margin
+    for (let k = 0; k < 3; ++k) {
+      lower[k] -= 0.001;
+      upper[k] += 0.001;
+    }
+  }
+
+  next_residue(atom, backward) {
+    const len = this.atoms.length;
+    const start = (atom ? atom.i_seq : 0) + len;  // +len to avoid idx<0 below
+    for (let i = (atom ? 1 : 0); i < len; i++) {
+      const idx = (start + (backward ? -i : i)) % len;
+      const a = this.atoms[idx];
+      if (!a.is_main_conformer()) continue;
+      if ((a.name === 'CA' && a.element === 'C') || a.name === 'P') {
+        return a;
+      }
+    }
+  }
+
+  extract_trace() {
+    const segments = [];
+    let current_segment = [];
+    let last_atom = null;
+    for (let i = 0; i < this.atoms.length; i++) {
+      const atom = this.atoms[i];
+      if (atom.altloc !== '' && atom.altloc !== 'A') continue;
+      if ((atom.name === 'CA' && atom.element === 'C') || atom.name === 'P') {
+        let start_new = true;
+        if (last_atom !== null && last_atom.chain_index === atom.chain_index) {
+          const dxyz2 = atom.distance_sq(last_atom);
+          if ((atom.name === 'CA' && dxyz2 <= 5.5*5.5) ||
+              (atom.name === 'P' && dxyz2 < 7.5*7.5)) {
+            current_segment.push(atom);
+            start_new = false;
+          }
+        }
+        if (start_new) {
+          if (current_segment.length > 2) {
+            segments.push(current_segment);
+          }
+          current_segment = [atom];
+        }
+        last_atom = atom;
+      }
+    }
+    if (current_segment.length > 2) {
+      segments.push(current_segment);
+    }
+    //console.log(segments.length + " segments extracted");
+    return segments;
+  }
+
+  get_residues() {
+    if (this.residue_map != null) return this.residue_map;
+    const residues = {};
+    for (let i = 0; i < this.atoms.length; i++) {
+      const atom = this.atoms[i];
+      const resid = atom.resid();
+      const reslist = residues[resid];
+      if (reslist === undefined) {
+        residues[resid] = [atom];
+      } else {
+        reslist.push(atom);
+      }
+    }
+    this.residue_map = residues;
+    return residues;
+  }
+
+  // tangent vector to the ribbon representation
+  calculate_tangent_vector(residue) {
+    let a1 = null;
+    let a2 = null;
+    // it may be too simplistic
+    const peptide = (residue[0].resname.length === 3);
+    const name1 = peptide ? 'C' : 'C2\'';
+    const name2 = peptide ? 'O' : 'O4\'';
+    for (let i = 0; i < residue.length; i++) {
+      const atom = residue[i];
+      if (!atom.is_main_conformer()) continue;
+      if (atom.name === name1) {
+        a1 = atom.xyz;
+      } else if (atom.name === name2) {
+        a2 = atom.xyz;
+      }
+    }
+    if (a1 === null || a2 === null) return [0, 0, 1]; // arbitrary value
+    const d = [a1[0]-a2[0], a1[1]-a2[1], a1[2]-a2[2]];
+    const len = Math.sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+    return [d[0]/len, d[1]/len, d[2]/len];
+  }
+
+  get_center() {
+    let xsum = 0, ysum = 0, zsum = 0;
+    const n_atoms = this.atoms.length;
+    for (let i = 0; i < n_atoms; i++) {
+      const xyz = this.atoms[i].xyz;
+      xsum += xyz[0];
+      ysum += xyz[1];
+      zsum += xyz[2];
+    }
+    return [xsum / n_atoms, ysum / n_atoms, zsum / n_atoms];
+  }
+
+  calculate_connectivity() {
+    const atoms = this.atoms;
+    const cubes = this.calculate_cubicles();
+    for (const atom of atoms) {
+      atom.bonds = [];
+      atom.bond_types = [];
+    }
+    //let cnt = 0;
+    for (let i = 0; i < cubes.boxes.length; i++) {
+      const box = cubes.boxes[i];
+      if (box.length === 0) continue;
+      const nearby_atoms = cubes.get_nearby_atoms(i);
+      for (let a = 0; a < box.length; a++) {
+        const atom_id = box[a];
+        for (let k = 0; k < nearby_atoms.length; k++) {
+          const j = nearby_atoms[k];
+          if (j > atom_id && atoms[atom_id].is_bonded_to(atoms[j])) {
+            this.add_bond(atom_id, j, BondType.Unspec);
+            //cnt++;
+          }
+        }
+      }
+    }
+    //console.log(atoms.length + ' atoms, ' + cnt + ' bonds.');
+  }
+
+  calculate_cubicles() {
+    const cubes = new Cubicles(this.atoms, 3.0, this.lower_bound, this.upper_bound);
+    this.cubes = cubes;
+    return cubes;
+  }
+
+  apply_bond_data(bond_data) {
+    for (const atom of this.atoms) {
+      atom.bonds = [];
+      atom.bond_types = [];
+    }
+    for (let i = 0; i + 2 < bond_data.length; i += 3) {
+      const idx1 = bond_data[i];
+      const idx2 = bond_data[i+1];
+      const bond_type = bond_data[i+2] ;
+      if (idx1 < 0 || idx2 < 0 ||
+          idx1 >= this.atoms.length || idx2 >= this.atoms.length) {
+        continue;
+      }
+      this.add_bond(idx1, idx2, bond_type);
+    }
+    this.calculate_cubicles();
+  }
+
+  add_bond(idx1, idx2, bond_type) {
+    this.atoms[idx1].bonds.push(idx2);
+    this.atoms[idx1].bond_types.push(bond_type);
+    this.atoms[idx2].bonds.push(idx1);
+    this.atoms[idx2].bond_types.push(bond_type);
+  }
+
+  get_nearest_atom(x, y, z, atom_name) {
+    const cubes = this.cubes;
+    if (cubes == null) throw Error('Missing Cubicles');
+    const box_id = cubes.find_box_id(x, y, z);
+    const indices = cubes.get_nearby_atoms(box_id);
+    let nearest = null;
+    let min_d2 = Infinity;
+    for (let i = 0; i < indices.length; i++) {
+      const atom = this.atoms[indices[i]];
+      if (atom_name != null && atom_name !== atom.name) continue;
+      const dx = atom.xyz[0] - x;
+      const dy = atom.xyz[1] - y;
+      const dz = atom.xyz[2] - z;
+      const d2 = dx*dx + dy*dy + dz*dz;
+      if (d2 < min_d2) {
+        nearest = atom;
+        min_d2 = d2;
+      }
+    }
+    return nearest;
+  }
+}
+
+// Single atom and associated labels
+class Atom {
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+
+  constructor() {
+    this.name = '';
+    this.altloc = '';
+    this.resname = '';
+    this.chain = '';
+    this.chain_index = -1;
+    this.seqid = '';
+    this.xyz = [0, 0, 0];
+    this.occ = 1.0;
+    this.b = 0;
+    this.element = '';
+    this.i_seq = -1;
+    this.is_ligand = null;
+    this.bonds = [];
+    this.bond_types = [];
+  }
+
+  distance_sq(other) {
+    const dx = this.xyz[0] - other.xyz[0];
+    const dy = this.xyz[1] - other.xyz[1];
+    const dz = this.xyz[2] - other.xyz[2];
+    return dx*dx + dy*dy + dz*dz;
+  }
+
+  distance(other) {
+    return Math.sqrt(this.distance_sq(other));
+  }
+
+  midpoint(other) {
+    return [(this.xyz[0] + other.xyz[0]) / 2,
+            (this.xyz[1] + other.xyz[1]) / 2,
+            (this.xyz[2] + other.xyz[2]) / 2];
+  }
+
+  is_hydrogen() {
+    return this.element === 'H' || this.element === 'D';
+  }
+
+  is_ion() {
+    return this.element === this.resname;
+  }
+
+  is_water() {
+    return this.resname === 'HOH';
+  }
+
+  is_same_conformer(other) {
+    return this.altloc === '' || other.altloc === '' ||
+           this.altloc === other.altloc;
+  }
+
+  is_main_conformer() {
+    return this.altloc === '' || this.altloc === 'A';
+  }
+
+  bond_radius() { // rather crude
+    if (this.element === 'H') return 1.3;
+    if (this.element === 'S' || this.element === 'P') return 2.43;
+    return 1.99;
+  }
+
+  is_bonded_to(other) {
+    const MAX_DIST = 2.2 * 2.2;
+    if (!this.is_same_conformer(other)) return false;
+    const dxyz2 = this.distance_sq(other);
+    if (dxyz2 > MAX_DIST) return false;
+    if (this.element === 'H' && other.element === 'H') return false;
+    return dxyz2 <= this.bond_radius() * other.bond_radius();
+  }
+
+  resid() {
+    return this.seqid + '/' + this.chain;
+  }
+
+  long_label() {
+    return this.name + ' /' + this.seqid + ' ' + this.resname + '/' + this.chain +
+           ' - occ: ' + this.occ.toFixed(2) + ' bf: ' + this.b.toFixed(2) +
+           ' ele: ' + this.element + ' pos: (' + this.xyz[0].toFixed(2) + ',' +
+           this.xyz[1].toFixed(2) + ',' + this.xyz[2].toFixed(2) + ')';
+  }
+
+  short_label() {
+    return this.name + ' /' + this.seqid + ' ' + this.resname + '/' + this.chain;
+  }
+}
+
+
+// Partition atoms into boxes for quick neighbor searching.
+class Cubicles {
+  
+  
+  
+  
+  
+  
+  
+
+  constructor(atoms, box_length,
+              lower_bound, upper_bound) {
+    this.boxes = [];
+    this.box_length = box_length;
+    this.lower_bound = lower_bound;
+    this.upper_bound = upper_bound;
+    this.xdim = Math.ceil((upper_bound[0] - lower_bound[0]) / box_length);
+    this.ydim = Math.ceil((upper_bound[1] - lower_bound[1]) / box_length);
+    this.zdim = Math.ceil((upper_bound[2] - lower_bound[2]) / box_length);
+    //console.log("Cubicles: " + this.xdim + "x" + this.ydim + "x" + this.zdim);
+    const nxyz = this.xdim * this.ydim * this.zdim;
+    for (let j = 0; j < nxyz; j++) {
+      this.boxes.push([]);
+    }
+    for (let i = 0; i < atoms.length; i++) {
+      const xyz = atoms[i].xyz;
+      const box_id = this.find_box_id(xyz[0], xyz[1], xyz[2]);
+      if (box_id === null) {
+        throw Error('wrong cubicle');
+      }
+      this.boxes[box_id].push(i);
+    }
+  }
+
+  find_box_id(x, y, z) {
+    const xstep = Math.floor((x - this.lower_bound[0]) / this.box_length);
+    const ystep = Math.floor((y - this.lower_bound[1]) / this.box_length);
+    const zstep = Math.floor((z - this.lower_bound[2]) / this.box_length);
+    const box_id = (zstep * this.ydim + ystep) * this.xdim + xstep;
+    if (box_id < 0 || box_id >= this.boxes.length) throw Error('Ups!');
+    return box_id;
+  }
+
+  get_nearby_atoms(box_id) {
+    const indices = [];
+    const xydim = this.xdim * this.ydim;
+    const uv = Math.max(box_id % xydim, 0);
+    const u = Math.max(uv % this.xdim, 0);
+    const v = Math.floor(uv / this.xdim);
+    const w = Math.floor(box_id / xydim);
+    console.assert((w * xydim) + (v * this.xdim) + u === box_id);
+    for (let iu = u-1; iu <= u+1; iu++) {
+      if (iu < 0 || iu >= this.xdim) continue;
+      for (let iv = v-1; iv <= v+1; iv++) {
+        if (iv < 0 || iv >= this.ydim) continue;
+        for (let iw = w-1; iw <= w+1; iw++) {
+          if (iw < 0 || iw >= this.zdim) continue;
+          const other_box_id = (iw * xydim) + (iv * this.xdim) + iu;
+          if (other_box_id >= this.boxes.length || other_box_id < 0) {
+            throw Error('Box out of bounds: ID ' + other_box_id);
+          }
+          const box = this.boxes[other_box_id];
+          for (let i = 0; i < box.length; i++) {
+            indices.push(box[i]);
+          }
+        }
+      }
+    }
+    return indices;
+  }
+}
+
+class Block {
+  
+  
+  
+  constructor() {
+    this._points = null;
+    this._values = null;
+    this._size = [0, 0, 0];
+  }
+
+  set(points, values, size) {
+    if (size[0] <= 0 || size[1] <= 0 || size[2] <= 0) {
+      throw Error('Grid dimensions are zero along at least one edge');
+    }
+    const len = size[0] * size[1] * size[2];
+    if (values.length !== len || points.length !== len) {
+      throw Error('isosurface: array size mismatch');
+    }
+
+    this._points = points;
+    this._values = values;
+    this._size = size;
+  }
+
+  clear() {
+    this._points = null;
+    this._values = null;
+  }
+
+  empty()  {
+    return this._values === null;
+  }
+
+  isosurface(isolevel, method) {
+    //if (method === 'marching tetrahedra') {
+    //  return marchingTetrahedra(block, isolevel);
+    //}
+    return marchingCubes(this._size, this._values, this._points,
+                         isolevel, method);
+  }
+}
+
+/* eslint comma-spacing: 0, no-multi-spaces: 0 */
+
+const edgeTable = new Int32Array([
+  0x0  , 0x0  , 0x202, 0x302, 0x406, 0x406, 0x604, 0x704,
+  0x804, 0x805, 0xa06, 0xa06, 0xc0a, 0xd03, 0xe08, 0xf00,
+  0x90 , 0x98 , 0x292, 0x292, 0x496, 0x49e, 0x694, 0x694,
+  0x894, 0x894, 0xa96, 0xa96, 0xc9a, 0xc92, 0xe91, 0xe90,
+  0x230, 0x230, 0x33 , 0x13a, 0x636, 0x636, 0x434, 0x43c,
+  0xa34, 0xa35, 0x837, 0x936, 0xe3a, 0xf32, 0xc31, 0xd30,
+  0x2a0, 0x2a8, 0xa3 , 0xaa , 0x6a6, 0x6af, 0x5a4, 0x4ac,
+  0xaa4, 0xaa4, 0x9a6, 0x8a6, 0xfaa, 0xea3, 0xca1, 0xca0,
+  0x460, 0x460, 0x662, 0x762, 0x66 , 0x66 , 0x265, 0x364,
+  0xc64, 0xc65, 0xe66, 0xe66, 0x86a, 0x863, 0xa69, 0xa60,
+  0x4f0, 0x4f8, 0x6f2, 0x6f2, 0xf6 , 0xfe , 0x2f5, 0x2fc,
+  0xcf4, 0xcf4, 0xef6, 0xef6, 0x8fa, 0x8f3, 0xaf9, 0xaf0,
+  0x650, 0x650, 0x453, 0x552, 0x256, 0x256, 0x54 , 0x154,
+  0xe54, 0xf54, 0xc57, 0xd56, 0xa5a, 0xb52, 0x859, 0x950,
+  0x7c0, 0x6c1, 0x5c2, 0x4c2, 0x3c6, 0x2ce, 0xc5 , 0xc4 ,
+  0xfc4, 0xec5, 0xdc6, 0xcc6, 0xbca, 0xac2, 0x8c1, 0x8c0,
+  0x8c0, 0x8c0, 0xac2, 0xbc2, 0xcc6, 0xcc6, 0xec4, 0xfcc,
+  0xc4 , 0xc5 , 0x2c6, 0x3c6, 0x4c2, 0x5c2, 0x6c1, 0x7c0,
+  0x950, 0x859, 0xb52, 0xa5a, 0xd56, 0xc57, 0xe54, 0xe5c,
+  0x154, 0x54 , 0x25e, 0x256, 0x552, 0x453, 0x658, 0x650,
+  0xaf0, 0xaf0, 0x8f3, 0x8fa, 0xef6, 0xef6, 0xcf4, 0xcfc,
+  0x2f4, 0x3f5, 0xff , 0x1f6, 0x6f2, 0x6f3, 0x4f9, 0x5f0,
+  0xa60, 0xa69, 0x863, 0x86a, 0xe66, 0xe67, 0xd65, 0xc6c,
+  0x364, 0x265, 0x166, 0x66 , 0x76a, 0x663, 0x460, 0x460,
+  0xca0, 0xca0, 0xea2, 0xfa2, 0x8a6, 0x8a6, 0xaa4, 0xba4,
+  0x4ac, 0x5a4, 0x6ae, 0x7a6, 0xaa , 0xa3 , 0x2a8, 0x2a0,
+  0xd30, 0xc31, 0xf32, 0xe3a, 0x936, 0x837, 0xb35, 0xa34,
+  0x43c, 0x434, 0x73e, 0x636, 0x13a, 0x33 , 0x339, 0x230,
+  0xe90, 0xe90, 0xc92, 0xc9a, 0xa96, 0xa96, 0x894, 0x89c,
+  0x694, 0x695, 0x49f, 0x496, 0x292, 0x392, 0x98 , 0x90 ,
+  0xf00, 0xe08, 0xd03, 0xc0a, 0xa06, 0xa0e, 0x805, 0x804,
+  0x704, 0x604, 0x506, 0x406, 0x302, 0x202, 0x0  , 0x0]);
+
+
+// generated from classical triTable by tools/isolut.py
+const segTable = [
+  [],
+  [],
+  [1, 9],
+  [1, 8, 1, 9],
+  [2, 10, 10, 1],
+  [2, 10, 10, 1],
+  [9, 2, 2, 10, 10, 9],
+  [2, 8, 2, 10, 10, 8, 10, 9],
+  [11, 2],
+  [0, 11, 11, 2],
+  [1, 9, 11, 2],
+  [1, 11, 11, 2, 1, 9, 9, 11],
+  [3, 10, 10, 1, 11, 10],
+  [0, 10, 10, 1, 8, 10, 11, 10],
+  [3, 9, 11, 9, 11, 10, 10, 9],
+  [8, 10, 10, 9, 11, 10],
+  [4, 7],
+  [4, 3, 4, 7],
+  [1, 9, 4, 7],
+  [4, 1, 1, 9, 4, 7, 7, 1],
+  [2, 10, 10, 1, 4, 7],
+  [3, 4, 4, 7, 2, 10, 10, 1],
+  [9, 2, 2, 10, 10, 9, 4, 7],
+  [2, 10, 10, 9, 9, 2, 9, 7, 7, 2, 4, 7],
+  [4, 7, 11, 2],
+  [11, 4, 4, 7, 11, 2, 2, 4],
+  [1, 9, 4, 7, 11, 2],
+  [4, 7, 11, 4, 11, 9, 11, 2, 2, 9, 1, 9],
+  [3, 10, 10, 1, 11, 10, 4, 7],
+  [1, 11, 11, 10, 10, 1, 1, 4, 4, 11, 4, 7],
+  [4, 7, 0, 11, 11, 9, 11, 10, 10, 9],
+  [4, 7, 11, 4, 11, 9, 11, 10, 10, 9],
+  [9, 5, 5, 4],
+  [9, 5, 5, 4],
+  [0, 5, 5, 4, 1, 5],
+  [8, 5, 5, 4, 3, 5, 1, 5],
+  [2, 10, 10, 1, 9, 5, 5, 4],
+  [2, 10, 10, 1, 9, 5, 5, 4],
+  [5, 2, 2, 10, 10, 5, 5, 4, 4, 2],
+  [2, 10, 10, 5, 5, 2, 5, 3, 5, 4, 4, 3],
+  [9, 5, 5, 4, 11, 2],
+  [0, 11, 11, 2, 9, 5, 5, 4],
+  [0, 5, 5, 4, 1, 5, 11, 2],
+  [1, 5, 5, 2, 5, 8, 8, 2, 11, 2, 5, 4],
+  [10, 3, 11, 10, 10, 1, 9, 5, 5, 4],
+  [9, 5, 5, 4, 8, 1, 8, 10, 10, 1, 11, 10],
+  [5, 4, 0, 5, 0, 11, 11, 5, 11, 10, 10, 5],
+  [5, 4, 8, 5, 8, 10, 10, 5, 11, 10],
+  [9, 7, 5, 7, 9, 5],
+  [9, 3, 9, 5, 5, 3, 5, 7],
+  [0, 7, 1, 7, 1, 5, 5, 7],
+  [1, 5, 5, 3, 5, 7],
+  [9, 7, 9, 5, 5, 7, 10, 1, 2, 10],
+  [10, 1, 2, 10, 9, 5, 5, 0, 5, 3, 5, 7],
+  [2, 8, 2, 5, 5, 8, 5, 7, 10, 5, 2, 10],
+  [2, 10, 10, 5, 5, 2, 5, 3, 5, 7],
+  [7, 9, 9, 5, 5, 7, 11, 2],
+  [9, 5, 5, 7, 7, 9, 7, 2, 2, 9, 11, 2],
+  [11, 2, 1, 8, 1, 7, 1, 5, 5, 7],
+  [11, 2, 1, 11, 1, 7, 1, 5, 5, 7],
+  [9, 5, 5, 8, 5, 7, 10, 1, 3, 10, 11, 10],
+  [5, 7, 7, 0, 0, 5, 9, 5, 11, 0, 0, 10, 10, 1, 11, 10],
+  [11, 10, 10, 0, 0, 11, 10, 5, 5, 0, 0, 7, 5, 7],
+  [11, 10, 10, 5, 5, 11, 5, 7],
+  [10, 6, 6, 5, 5, 10],
+  [5, 10, 10, 6, 6, 5],
+  [1, 9, 5, 10, 10, 6, 6, 5],
+  [1, 8, 1, 9, 5, 10, 10, 6, 6, 5],
+  [1, 6, 6, 5, 5, 1, 2, 6],
+  [1, 6, 6, 5, 5, 1, 2, 6],
+  [9, 6, 6, 5, 5, 9, 0, 6, 2, 6],
+  [5, 9, 8, 5, 8, 2, 2, 5, 2, 6, 6, 5],
+  [11, 2, 10, 6, 6, 5, 5, 10],
+  [11, 0, 11, 2, 10, 6, 6, 5, 5, 10],
+  [1, 9, 11, 2, 5, 10, 10, 6, 6, 5],
+  [5, 10, 10, 6, 6, 5, 1, 9, 9, 2, 9, 11, 11, 2],
+  [6, 3, 11, 6, 6, 5, 5, 3, 5, 1],
+  [11, 0, 11, 5, 5, 0, 5, 1, 11, 6, 6, 5],
+  [11, 6, 6, 3, 6, 0, 6, 5, 5, 0, 5, 9],
+  [6, 5, 5, 9, 9, 6, 9, 11, 11, 6],
+  [5, 10, 10, 6, 6, 5, 4, 7],
+  [4, 3, 4, 7, 6, 5, 5, 10, 10, 6],
+  [1, 9, 5, 10, 10, 6, 6, 5, 4, 7],
+  [10, 6, 6, 5, 5, 10, 1, 9, 9, 7, 7, 1, 4, 7],
+  [6, 1, 2, 6, 6, 5, 5, 1, 4, 7],
+  [2, 5, 5, 1, 2, 6, 6, 5, 4, 3, 4, 7],
+  [4, 7, 0, 5, 5, 9, 0, 6, 6, 5, 2, 6],
+  [3, 9, 9, 7, 4, 7, 2, 9, 5, 9, 9, 6, 6, 5, 2, 6],
+  [11, 2, 4, 7, 10, 6, 6, 5, 5, 10],
+  [5, 10, 10, 6, 6, 5, 4, 7, 7, 2, 2, 4, 11, 2],
+  [1, 9, 4, 7, 11, 2, 5, 10, 10, 6, 6, 5],
+  [9, 2, 1, 9, 9, 11, 11, 2, 4, 11, 4, 7, 5, 10, 10, 6, 6, 5],
+  [4, 7, 11, 5, 5, 3, 5, 1, 11, 6, 6, 5],
+  [5, 1, 1, 11, 11, 5, 11, 6, 6, 5, 0, 11, 11, 4, 4, 7],
+  [0, 5, 5, 9, 0, 6, 6, 5, 3, 6, 11, 6, 4, 7],
+  [6, 5, 5, 9, 9, 6, 9, 11, 11, 6, 4, 7, 7, 9],
+  [10, 4, 9, 10, 6, 4, 10, 6],
+  [4, 10, 10, 6, 6, 4, 9, 10],
+  [10, 0, 1, 10, 10, 6, 6, 0, 6, 4],
+  [1, 8, 1, 6, 6, 8, 6, 4, 1, 10, 10, 6],
+  [1, 4, 9, 1, 2, 4, 2, 6, 6, 4],
+  [2, 9, 9, 1, 2, 4, 2, 6, 6, 4],
+  [2, 4, 2, 6, 6, 4],
+  [2, 8, 2, 4, 2, 6, 6, 4],
+  [10, 4, 9, 10, 10, 6, 6, 4, 11, 2],
+  [8, 2, 11, 2, 9, 10, 10, 4, 10, 6, 6, 4],
+  [11, 2, 1, 6, 6, 0, 6, 4, 1, 10, 10, 6],
+  [6, 4, 4, 1, 1, 6, 1, 10, 10, 6, 8, 1, 1, 11, 11, 2],
+  [9, 6, 6, 4, 9, 3, 3, 6, 9, 1, 11, 6],
+  [11, 1, 1, 8, 11, 6, 6, 1, 9, 1, 1, 4, 6, 4],
+  [11, 6, 6, 3, 6, 0, 6, 4],
+  [6, 4, 8, 6, 11, 6],
+  [7, 10, 10, 6, 6, 7, 8, 10, 9, 10],
+  [0, 7, 0, 10, 10, 7, 9, 10, 6, 7, 10, 6],
+  [10, 6, 6, 7, 7, 10, 1, 10, 7, 1, 8, 1],
+  [10, 6, 6, 7, 7, 10, 7, 1, 1, 10],
+  [2, 6, 6, 1, 6, 8, 8, 1, 9, 1, 6, 7],
+  [2, 6, 6, 9, 9, 2, 9, 1, 6, 7, 7, 9, 9, 3],
+  [0, 7, 0, 6, 6, 7, 2, 6],
+  [2, 7, 6, 7, 2, 6],
+  [11, 2, 10, 6, 6, 8, 8, 10, 9, 10, 6, 7],
+  [0, 7, 7, 2, 11, 2, 9, 7, 6, 7, 7, 10, 10, 6, 9, 10],
+  [1, 8, 1, 7, 1, 10, 10, 7, 6, 7, 10, 6, 11, 2],
+  [11, 2, 1, 11, 1, 7, 10, 6, 6, 1, 1, 10, 6, 7],
+  [9, 6, 6, 8, 6, 7, 9, 1, 1, 6, 11, 6, 6, 3],
+  [9, 1, 11, 6, 6, 7],
+  [0, 7, 0, 6, 6, 7, 11, 0, 11, 6],
+  [11, 6, 6, 7],
+  [7, 6, 6, 11],
+  [7, 6, 6, 11],
+  [1, 9, 7, 6, 6, 11],
+  [8, 1, 1, 9, 7, 6, 6, 11],
+  [10, 1, 2, 10, 6, 11, 7, 6],
+  [2, 10, 10, 1, 6, 11, 7, 6],
+  [2, 9, 2, 10, 10, 9, 6, 11, 7, 6],
+  [6, 11, 7, 6, 2, 10, 10, 3, 10, 8, 10, 9],
+  [7, 2, 6, 2, 7, 6],
+  [7, 0, 7, 6, 6, 0, 6, 2],
+  [2, 7, 7, 6, 6, 2, 1, 9],
+  [1, 6, 6, 2, 1, 8, 8, 6, 1, 9, 7, 6],
+  [10, 7, 7, 6, 6, 10, 10, 1, 1, 7],
+  [10, 7, 7, 6, 6, 10, 1, 7, 10, 1, 1, 8],
+  [7, 0, 7, 10, 10, 0, 10, 9, 6, 10, 7, 6],
+  [7, 6, 6, 10, 10, 7, 10, 8, 10, 9],
+  [6, 8, 4, 6, 6, 11],
+  [3, 6, 6, 11, 0, 6, 4, 6],
+  [8, 6, 6, 11, 4, 6, 1, 9],
+  [4, 6, 6, 9, 6, 3, 3, 9, 1, 9, 6, 11],
+  [6, 8, 4, 6, 6, 11, 2, 10, 10, 1],
+  [2, 10, 10, 1, 0, 11, 0, 6, 6, 11, 4, 6],
+  [4, 11, 4, 6, 6, 11, 2, 9, 2, 10, 10, 9],
+  [10, 9, 9, 3, 3, 10, 2, 10, 4, 3, 3, 6, 6, 11, 4, 6],
+  [8, 2, 4, 2, 4, 6, 6, 2],
+  [4, 2, 4, 6, 6, 2],
+  [1, 9, 3, 4, 4, 2, 4, 6, 6, 2],
+  [1, 9, 4, 1, 4, 2, 4, 6, 6, 2],
+  [8, 1, 8, 6, 6, 1, 4, 6, 6, 10, 10, 1],
+  [10, 1, 0, 10, 0, 6, 6, 10, 4, 6],
+  [4, 6, 6, 3, 3, 4, 6, 10, 10, 3, 3, 9, 10, 9],
+  [10, 9, 4, 10, 6, 10, 4, 6],
+  [9, 5, 5, 4, 7, 6, 6, 11],
+  [9, 5, 5, 4, 7, 6, 6, 11],
+  [5, 0, 1, 5, 5, 4, 7, 6, 6, 11],
+  [7, 6, 6, 11, 3, 4, 3, 5, 5, 4, 1, 5],
+  [9, 5, 5, 4, 10, 1, 2, 10, 7, 6, 6, 11],
+  [6, 11, 7, 6, 2, 10, 10, 1, 9, 5, 5, 4],
+  [7, 6, 6, 11, 5, 4, 4, 10, 10, 5, 4, 2, 2, 10],
+  [3, 4, 3, 5, 5, 4, 2, 5, 10, 5, 2, 10, 7, 6, 6, 11],
+  [7, 2, 7, 6, 6, 2, 5, 4, 9, 5],
+  [9, 5, 5, 4, 8, 6, 6, 0, 6, 2, 7, 6],
+  [3, 6, 6, 2, 7, 6, 1, 5, 5, 0, 5, 4],
+  [6, 2, 2, 8, 8, 6, 7, 6, 1, 8, 8, 5, 5, 4, 1, 5],
+  [9, 5, 5, 4, 10, 1, 1, 6, 6, 10, 1, 7, 7, 6],
+  [1, 6, 6, 10, 10, 1, 1, 7, 7, 6, 0, 7, 9, 5, 5, 4],
+  [0, 10, 10, 4, 10, 5, 5, 4, 3, 10, 6, 10, 10, 7, 7, 6],
+  [7, 6, 6, 10, 10, 7, 10, 8, 5, 4, 4, 10, 10, 5],
+  [6, 9, 9, 5, 5, 6, 6, 11, 11, 9],
+  [3, 6, 6, 11, 0, 6, 0, 5, 5, 6, 9, 5],
+  [0, 11, 0, 5, 5, 11, 1, 5, 5, 6, 6, 11],
+  [6, 11, 3, 6, 3, 5, 5, 6, 1, 5],
+  [2, 10, 10, 1, 9, 5, 5, 11, 11, 9, 5, 6, 6, 11],
+  [0, 11, 0, 6, 6, 11, 9, 6, 5, 6, 9, 5, 2, 10, 10, 1],
+  [8, 5, 5, 11, 5, 6, 6, 11, 0, 5, 10, 5, 5, 2, 2, 10],
+  [6, 11, 3, 6, 3, 5, 5, 6, 2, 10, 10, 3, 10, 5],
+  [5, 8, 9, 5, 5, 2, 2, 8, 5, 6, 6, 2],
+  [9, 5, 5, 6, 6, 9, 6, 0, 6, 2],
+  [1, 5, 5, 8, 8, 1, 5, 6, 6, 8, 8, 2, 6, 2],
+  [1, 5, 5, 6, 6, 1, 6, 2],
+  [3, 6, 6, 1, 6, 10, 10, 1, 8, 6, 5, 6, 6, 9, 9, 5],
+  [10, 1, 0, 10, 0, 6, 6, 10, 9, 5, 5, 0, 5, 6],
+  [5, 6, 6, 10, 10, 5],
+  [10, 5, 5, 6, 6, 10],
+  [11, 5, 5, 10, 10, 11, 7, 5],
+  [11, 5, 5, 10, 10, 11, 7, 5],
+  [5, 11, 7, 5, 5, 10, 10, 11, 1, 9],
+  [10, 7, 7, 5, 5, 10, 10, 11, 8, 1, 1, 9],
+  [11, 1, 2, 11, 7, 1, 7, 5, 5, 1],
+  [2, 7, 7, 1, 7, 5, 5, 1, 2, 11],
+  [9, 7, 7, 5, 5, 9, 9, 2, 2, 7, 2, 11],
+  [7, 5, 5, 2, 2, 7, 2, 11, 5, 9, 9, 2, 2, 8],
+  [2, 5, 5, 10, 10, 2, 3, 5, 7, 5],
+  [8, 2, 8, 5, 5, 2, 7, 5, 10, 2, 5, 10],
+  [1, 9, 5, 10, 10, 3, 3, 5, 7, 5, 10, 2],
+  [8, 2, 2, 9, 1, 9, 7, 2, 10, 2, 2, 5, 5, 10, 7, 5],
+  [3, 5, 5, 1, 7, 5],
+  [7, 0, 7, 1, 7, 5, 5, 1],
+  [3, 9, 3, 5, 5, 9, 7, 5],
+  [7, 9, 5, 9, 7, 5],
+  [5, 8, 4, 5, 5, 10, 10, 8, 10, 11],
+  [5, 0, 4, 5, 5, 11, 11, 0, 5, 10, 10, 11],
+  [1, 9, 4, 10, 10, 8, 10, 11, 4, 5, 5, 10],
+  [10, 11, 11, 4, 4, 10, 4, 5, 5, 10, 3, 4, 4, 1, 1, 9],
+  [2, 5, 5, 1, 2, 8, 8, 5, 2, 11, 4, 5],
+  [4, 11, 11, 0, 4, 5, 5, 11, 2, 11, 11, 1, 5, 1],
+  [2, 5, 5, 0, 5, 9, 2, 11, 11, 5, 4, 5, 5, 8],
+  [4, 5, 5, 9, 2, 11],
+  [2, 5, 5, 10, 10, 2, 3, 5, 3, 4, 4, 5],
+  [5, 10, 10, 2, 2, 5, 2, 4, 4, 5],
+  [3, 10, 10, 2, 3, 5, 5, 10, 8, 5, 4, 5, 1, 9],
+  [5, 10, 10, 2, 2, 5, 2, 4, 4, 5, 1, 9, 9, 2],
+  [4, 5, 5, 8, 5, 3, 5, 1],
+  [4, 5, 5, 0, 5, 1],
+  [4, 5, 5, 8, 5, 3, 0, 5, 5, 9],
+  [4, 5, 5, 9],
+  [4, 11, 7, 4, 9, 11, 9, 10, 10, 11],
+  [9, 7, 7, 4, 9, 11, 9, 10, 10, 11],
+  [1, 10, 10, 11, 11, 1, 11, 4, 4, 1, 7, 4],
+  [1, 4, 4, 3, 1, 10, 10, 4, 7, 4, 4, 11, 10, 11],
+  [4, 11, 7, 4, 9, 11, 9, 2, 2, 11, 9, 1],
+  [9, 7, 7, 4, 9, 11, 9, 1, 1, 11, 2, 11],
+  [7, 4, 4, 11, 4, 2, 2, 11],
+  [7, 4, 4, 11, 4, 2, 2, 11, 3, 4],
+  [2, 9, 9, 10, 10, 2, 2, 7, 7, 9, 7, 4],
+  [9, 10, 10, 7, 7, 9, 7, 4, 10, 2, 2, 7, 7, 0],
+  [7, 10, 10, 3, 10, 2, 7, 4, 4, 10, 1, 10, 10, 0],
+  [1, 10, 10, 2, 7, 4],
+  [9, 1, 1, 4, 1, 7, 7, 4],
+  [9, 1, 1, 4, 1, 7, 7, 4, 8, 1],
+  [3, 4, 7, 4],
+  [7, 4],
+  [9, 10, 10, 8, 10, 11],
+  [9, 3, 9, 11, 9, 10, 10, 11],
+  [1, 10, 10, 0, 10, 8, 10, 11],
+  [1, 10, 10, 3, 10, 11],
+  [2, 11, 11, 1, 11, 9, 9, 1],
+  [9, 3, 9, 11, 2, 9, 9, 1, 2, 11],
+  [2, 11, 11, 0],
+  [2, 11],
+  [8, 2, 8, 10, 10, 2, 9, 10],
+  [9, 10, 10, 2, 2, 9],
+  [8, 2, 8, 10, 10, 2, 1, 8, 1, 10],
+  [1, 10, 10, 2],
+  [8, 1, 9, 1],
+  [9, 1],
+  [],
+  []];
+
+const segTable2 = [
+  [],
+  [],
+  [1, 9],
+  [1, 9],
+  [2, 10, 10, 1],
+  [2, 10, 10, 1],
+  [2, 10, 10, 9],
+  [2, 10, 10, 9],
+  [11, 2],
+  [11, 2],
+  [1, 9, 11, 2],
+  [11, 2, 1, 9],
+  [10, 1, 11, 10],
+  [10, 1, 11, 10],
+  [11, 10, 10, 9],
+  [10, 9, 11, 10],
+  [4, 7],
+  [4, 7],
+  [1, 9, 4, 7],
+  [1, 9, 4, 7],
+  [2, 10, 10, 1, 4, 7],
+  [4, 7, 2, 10, 10, 1],
+  [2, 10, 10, 9, 4, 7],
+  [2, 10, 10, 9, 4, 7],
+  [4, 7, 11, 2],
+  [4, 7, 11, 2],
+  [1, 9, 4, 7, 11, 2],
+  [4, 7, 11, 2, 1, 9],
+  [10, 1, 11, 10, 4, 7],
+  [11, 10, 10, 1, 4, 7],
+  [4, 7, 11, 10, 10, 9],
+  [4, 7, 11, 10, 10, 9],
+  [9, 5, 5, 4],
+  [9, 5, 5, 4],
+  [5, 4, 1, 5],
+  [5, 4, 1, 5],
+  [2, 10, 10, 1, 9, 5, 5, 4],
+  [2, 10, 10, 1, 9, 5, 5, 4],
+  [2, 10, 10, 5, 5, 4],
+  [2, 10, 10, 5, 5, 4],
+  [9, 5, 5, 4, 11, 2],
+  [11, 2, 9, 5, 5, 4],
+  [5, 4, 1, 5, 11, 2],
+  [1, 5, 11, 2, 5, 4],
+  [11, 10, 10, 1, 9, 5, 5, 4],
+  [9, 5, 5, 4, 10, 1, 11, 10],
+  [5, 4, 11, 10, 10, 5],
+  [5, 4, 10, 5, 11, 10],
+  [5, 7, 9, 5],
+  [9, 5, 5, 7],
+  [1, 5, 5, 7],
+  [1, 5, 5, 7],
+  [9, 5, 5, 7, 10, 1, 2, 10],
+  [10, 1, 2, 10, 9, 5, 5, 7],
+  [5, 7, 10, 5, 2, 10],
+  [2, 10, 10, 5, 5, 7],
+  [9, 5, 5, 7, 11, 2],
+  [9, 5, 5, 7, 11, 2],
+  [11, 2, 1, 5, 5, 7],
+  [11, 2, 1, 5, 5, 7],
+  [9, 5, 5, 7, 10, 1, 11, 10],
+  [5, 7, 9, 5, 10, 1, 11, 10],
+  [11, 10, 10, 5, 5, 7],
+  [11, 10, 10, 5, 5, 7],
+  [10, 6, 6, 5, 5, 10],
+  [5, 10, 10, 6, 6, 5],
+  [1, 9, 5, 10, 10, 6, 6, 5],
+  [1, 9, 5, 10, 10, 6, 6, 5],
+  [6, 5, 5, 1, 2, 6],
+  [6, 5, 5, 1, 2, 6],
+  [6, 5, 5, 9, 2, 6],
+  [5, 9, 2, 6, 6, 5],
+  [11, 2, 10, 6, 6, 5, 5, 10],
+  [11, 2, 10, 6, 6, 5, 5, 10],
+  [1, 9, 11, 2, 5, 10, 10, 6, 6, 5],
+  [5, 10, 10, 6, 6, 5, 1, 9, 11, 2],
+  [11, 6, 6, 5, 5, 1],
+  [5, 1, 11, 6, 6, 5],
+  [11, 6, 6, 5, 5, 9],
+  [6, 5, 5, 9, 11, 6],
+  [5, 10, 10, 6, 6, 5, 4, 7],
+  [4, 7, 6, 5, 5, 10, 10, 6],
+  [1, 9, 5, 10, 10, 6, 6, 5, 4, 7],
+  [10, 6, 6, 5, 5, 10, 1, 9, 4, 7],
+  [2, 6, 6, 5, 5, 1, 4, 7],
+  [5, 1, 2, 6, 6, 5, 4, 7],
+  [4, 7, 5, 9, 6, 5, 2, 6],
+  [4, 7, 5, 9, 6, 5, 2, 6],
+  [11, 2, 4, 7, 10, 6, 6, 5, 5, 10],
+  [5, 10, 10, 6, 6, 5, 4, 7, 11, 2],
+  [1, 9, 4, 7, 11, 2, 5, 10, 10, 6, 6, 5],
+  [1, 9, 11, 2, 4, 7, 5, 10, 10, 6, 6, 5],
+  [4, 7, 5, 1, 11, 6, 6, 5],
+  [5, 1, 11, 6, 6, 5, 4, 7],
+  [5, 9, 6, 5, 11, 6, 4, 7],
+  [6, 5, 5, 9, 11, 6, 4, 7],
+  [9, 10, 6, 4, 10, 6],
+  [10, 6, 6, 4, 9, 10],
+  [1, 10, 10, 6, 6, 4],
+  [6, 4, 1, 10, 10, 6],
+  [9, 1, 2, 6, 6, 4],
+  [9, 1, 2, 6, 6, 4],
+  [2, 6, 6, 4],
+  [2, 6, 6, 4],
+  [9, 10, 10, 6, 6, 4, 11, 2],
+  [11, 2, 9, 10, 10, 6, 6, 4],
+  [11, 2, 6, 4, 1, 10, 10, 6],
+  [6, 4, 1, 10, 10, 6, 11, 2],
+  [6, 4, 9, 1, 11, 6],
+  [11, 6, 9, 1, 6, 4],
+  [11, 6, 6, 4],
+  [6, 4, 11, 6],
+  [10, 6, 6, 7, 9, 10],
+  [9, 10, 6, 7, 10, 6],
+  [10, 6, 6, 7, 1, 10],
+  [10, 6, 6, 7, 1, 10],
+  [2, 6, 9, 1, 6, 7],
+  [2, 6, 9, 1, 6, 7],
+  [6, 7, 2, 6],
+  [6, 7, 2, 6],
+  [11, 2, 10, 6, 9, 10, 6, 7],
+  [11, 2, 6, 7, 10, 6, 9, 10],
+  [1, 10, 6, 7, 10, 6, 11, 2],
+  [11, 2, 10, 6, 1, 10, 6, 7],
+  [6, 7, 9, 1, 11, 6],
+  [9, 1, 11, 6, 6, 7],
+  [6, 7, 11, 6],
+  [11, 6, 6, 7],
+  [7, 6, 6, 11],
+  [7, 6, 6, 11],
+  [1, 9, 7, 6, 6, 11],
+  [1, 9, 7, 6, 6, 11],
+  [10, 1, 2, 10, 6, 11, 7, 6],
+  [2, 10, 10, 1, 6, 11, 7, 6],
+  [2, 10, 10, 9, 6, 11, 7, 6],
+  [6, 11, 7, 6, 2, 10, 10, 9],
+  [6, 2, 7, 6],
+  [7, 6, 6, 2],
+  [7, 6, 6, 2, 1, 9],
+  [6, 2, 1, 9, 7, 6],
+  [7, 6, 6, 10, 10, 1],
+  [7, 6, 6, 10, 10, 1],
+  [10, 9, 6, 10, 7, 6],
+  [7, 6, 6, 10, 10, 9],
+  [4, 6, 6, 11],
+  [6, 11, 4, 6],
+  [6, 11, 4, 6, 1, 9],
+  [4, 6, 1, 9, 6, 11],
+  [4, 6, 6, 11, 2, 10, 10, 1],
+  [2, 10, 10, 1, 6, 11, 4, 6],
+  [4, 6, 6, 11, 2, 10, 10, 9],
+  [10, 9, 2, 10, 6, 11, 4, 6],
+  [4, 6, 6, 2],
+  [4, 6, 6, 2],
+  [1, 9, 4, 6, 6, 2],
+  [1, 9, 4, 6, 6, 2],
+  [4, 6, 6, 10, 10, 1],
+  [10, 1, 6, 10, 4, 6],
+  [4, 6, 6, 10, 10, 9],
+  [10, 9, 6, 10, 4, 6],
+  [9, 5, 5, 4, 7, 6, 6, 11],
+  [9, 5, 5, 4, 7, 6, 6, 11],
+  [1, 5, 5, 4, 7, 6, 6, 11],
+  [7, 6, 6, 11, 5, 4, 1, 5],
+  [9, 5, 5, 4, 10, 1, 2, 10, 7, 6, 6, 11],
+  [6, 11, 7, 6, 2, 10, 10, 1, 9, 5, 5, 4],
+  [7, 6, 6, 11, 5, 4, 10, 5, 2, 10],
+  [5, 4, 10, 5, 2, 10, 7, 6, 6, 11],
+  [7, 6, 6, 2, 5, 4, 9, 5],
+  [9, 5, 5, 4, 6, 2, 7, 6],
+  [6, 2, 7, 6, 1, 5, 5, 4],
+  [6, 2, 7, 6, 5, 4, 1, 5],
+  [9, 5, 5, 4, 10, 1, 6, 10, 7, 6],
+  [6, 10, 10, 1, 7, 6, 9, 5, 5, 4],
+  [10, 5, 5, 4, 6, 10, 7, 6],
+  [7, 6, 6, 10, 5, 4, 10, 5],
+  [9, 5, 5, 6, 6, 11],
+  [6, 11, 5, 6, 9, 5],
+  [1, 5, 5, 6, 6, 11],
+  [6, 11, 5, 6, 1, 5],
+  [2, 10, 10, 1, 9, 5, 5, 6, 6, 11],
+  [6, 11, 5, 6, 9, 5, 2, 10, 10, 1],
+  [5, 6, 6, 11, 10, 5, 2, 10],
+  [6, 11, 5, 6, 2, 10, 10, 5],
+  [9, 5, 5, 6, 6, 2],
+  [9, 5, 5, 6, 6, 2],
+  [1, 5, 5, 6, 6, 2],
+  [1, 5, 5, 6, 6, 2],
+  [6, 10, 10, 1, 5, 6, 9, 5],
+  [10, 1, 6, 10, 9, 5, 5, 6],
+  [5, 6, 6, 10, 10, 5],
+  [10, 5, 5, 6, 6, 10],
+  [5, 10, 10, 11, 7, 5],
+  [5, 10, 10, 11, 7, 5],
+  [7, 5, 5, 10, 10, 11, 1, 9],
+  [7, 5, 5, 10, 10, 11, 1, 9],
+  [2, 11, 7, 5, 5, 1],
+  [7, 5, 5, 1, 2, 11],
+  [7, 5, 5, 9, 2, 11],
+  [7, 5, 2, 11, 5, 9],
+  [5, 10, 10, 2, 7, 5],
+  [7, 5, 10, 2, 5, 10],
+  [1, 9, 5, 10, 7, 5, 10, 2],
+  [1, 9, 10, 2, 5, 10, 7, 5],
+  [5, 1, 7, 5],
+  [7, 5, 5, 1],
+  [5, 9, 7, 5],
+  [5, 9, 7, 5],
+  [4, 5, 5, 10, 10, 11],
+  [4, 5, 5, 10, 10, 11],
+  [1, 9, 10, 11, 4, 5, 5, 10],
+  [10, 11, 4, 5, 5, 10, 1, 9],
+  [5, 1, 2, 11, 4, 5],
+  [4, 5, 2, 11, 5, 1],
+  [5, 9, 2, 11, 4, 5],
+  [4, 5, 5, 9, 2, 11],
+  [5, 10, 10, 2, 4, 5],
+  [5, 10, 10, 2, 4, 5],
+  [10, 2, 5, 10, 4, 5, 1, 9],
+  [5, 10, 10, 2, 4, 5, 1, 9],
+  [4, 5, 5, 1],
+  [4, 5, 5, 1],
+  [4, 5, 5, 9],
+  [4, 5, 5, 9],
+  [7, 4, 9, 10, 10, 11],
+  [7, 4, 9, 10, 10, 11],
+  [1, 10, 10, 11, 7, 4],
+  [1, 10, 7, 4, 10, 11],
+  [7, 4, 2, 11, 9, 1],
+  [7, 4, 9, 1, 2, 11],
+  [7, 4, 2, 11],
+  [7, 4, 2, 11],
+  [9, 10, 10, 2, 7, 4],
+  [9, 10, 7, 4, 10, 2],
+  [10, 2, 7, 4, 1, 10],
+  [1, 10, 10, 2, 7, 4],
+  [9, 1, 7, 4],
+  [9, 1, 7, 4],
+  [7, 4],
+  [7, 4],
+  [9, 10, 10, 11],
+  [9, 10, 10, 11],
+  [1, 10, 10, 11],
+  [1, 10, 10, 11],
+  [2, 11, 9, 1],
+  [9, 1, 2, 11],
+  [2, 11],
+  [2, 11],
+  [10, 2, 9, 10],
+  [9, 10, 10, 2],
+  [10, 2, 1, 10],
+  [1, 10, 10, 2],
+  [9, 1],
+  [9, 1],
+  [],
+  []];
+
+const cubeVerts = [[0,0,0], [1,0,0], [1,1,0], [0,1,0],
+                   [0,0,1], [1,0,1], [1,1,1], [0,1,1]];
+const edgeIndex = [[0,1], [1,2], [2,3], [3,0], [4,5], [5,6],
+                   [6,7], [7,4], [0,4], [1,5], [2,6], [3,7]];
+// edge directions: [x, y, -x, -y, x, y, -x, -y, z, z, z, z]
+
+// return offsets relative to vertex [0,0,0]
+function calculateVertOffsets(dims) {
+  const vert_offsets = [];
+  for (let i = 0; i < 8; ++i) {
+    const v = cubeVerts[i];
+    vert_offsets.push(v[0] + dims[2] * (v[1] + dims[1] * v[2]));
+  }
+  return vert_offsets;
+}
+
+
+function marchingCubes(dims,
+                       values,
+                       points,
+                       isolevel,
+                       method) {
+  const snap = (method === 'snapped MC');
+  const seg_table = (method === 'squarish' ? segTable2 : segTable);
+  const vlist = new Array(12);
+  const vert_offsets = calculateVertOffsets(dims);
+  const vertex_values = new Float32Array(8);
+  const vertex_points = new Array(8);
+  const size_x = dims[0];
+  const size_y = dims[1];
+  const size_z = dims[2];
+  if (values == null || points == null) return;
+  const vertices = [];
+  const segments = [];
+  let vertex_count = 0;
+  for (let x = 0; x < size_x - 1; x++) {
+    for (let y = 0; y < size_y - 1; y++) {
+      for (let z = 0; z < size_z - 1; z++) {
+        const offset0 = z + size_z * (y + size_y * x);
+        let cubeindex = 0;
+        let i;
+        let j;
+        for (i = 0; i < 8; ++i) {
+          j = offset0 + vert_offsets[i];
+          cubeindex |= (values[j] < isolevel) ? 1 << i : 0;
+        }
+        if (cubeindex === 0 || cubeindex === 255) continue;
+        for (i = 0; i < 8; ++i) {
+          j = offset0 + vert_offsets[i];
+          vertex_values[i] = values[j];
+          vertex_points[i] = points[j];
+        }
+
+        // 12 bit number, indicates which edges are crossed by the isosurface
+        const edge_mask = edgeTable[cubeindex];
+
+        // check which edges are crossed, and estimate the point location
+        // using a weighted average of scalar values at edge endpoints.
+        for (i = 0; i < 12; ++i) {
+          if ((edge_mask & (1 << i)) !== 0) {
+            const e = edgeIndex[i];
+            let mu = (isolevel - vertex_values[e[0]]) /
+                     (vertex_values[e[1]] - vertex_values[e[0]]);
+            if (snap === true) {
+              if (mu > 0.85) mu = 1;
+              else if (mu < 0.15) mu = 0;
+            }
+            const p1 = vertex_points[e[0]];
+            const p2 = vertex_points[e[1]];
+            // The number of added vertices could be roughly halved
+            // if we avoided duplicates between neighbouring cells.
+            // Using a map for lookups is too slow, perhaps a big
+            // array would do?
+            vertices.push(p1[0] + (p2[0] - p1[0]) * mu,
+                          p1[1] + (p2[1] - p1[1]) * mu,
+                          p1[2] + (p2[2] - p1[2]) * mu);
+            vlist[i] = vertex_count++;
+          }
+        }
+        const t = seg_table[cubeindex];
+        for (i = 0; i < t.length; i++) {
+          segments.push(vlist[t[i]]);
+        }
+      }
+    }
+  }
+  return { vertices: vertices, segments: segments };
+}
+
+function modulo(a, b) {
+  const reminder = a % b;
+  return reminder >= 0 ? reminder : reminder + b;
+}
+
+class GridArray {
+  
+  
+
+  constructor(dim) {
+    this.dim = dim; // dimensions of the grid for the entire unit cell
+    this.values = new Float32Array(dim[0] * dim[1] * dim[2]);
+  }
+
+  grid2index(i, j, k) {
+    i = modulo(i, this.dim[0]);
+    j = modulo(j, this.dim[1]);
+    k = modulo(k, this.dim[2]);
+    return this.dim[2] * (this.dim[1] * i + j) + k;
+  }
+
+  grid2index_unchecked(i, j, k) {
+    return this.dim[2] * (this.dim[1] * i + j) + k;
+  }
+
+  grid2frac(i, j, k) {
+    return [i / this.dim[0], j / this.dim[1], k / this.dim[2]];
+  }
+
+  // return grid coordinates (rounded down) for the given fractional coordinates
+  frac2grid(xyz) {
+    // at one point "| 0" here made extract_block() 40% faster on V8 3.14,
+    // but I don't see any effect now
+    return [Math.floor(xyz[0] * this.dim[0]) | 0,
+            Math.floor(xyz[1] * this.dim[1]) | 0,
+            Math.floor(xyz[2] * this.dim[2]) | 0];
+  }
+
+  set_grid_value(i, j, k, value) {
+    const idx = this.grid2index(i, j, k);
+    this.values[idx] = value;
+  }
+
+  get_grid_value(i, j, k) {
+    const idx = this.grid2index(i, j, k);
+    return this.values[idx];
+  }
+}
+
+function calculate_stddev(a, offset) {
+  let sum = 0;
+  let sq_sum = 0;
+  const alen = a.length;
+  for (let i = offset; i < alen; i++) {
+    sum += a[i];
+    sq_sum += a[i] * a[i];
+  }
+  const mean = sum / (alen - offset);
+  const variance = sq_sum / (alen - offset) - mean * mean;
+  return {mean: mean, rms: Math.sqrt(variance)};
+}
+
+class ElMap {
+  
+  
+  
+  
+  
+   // used in ReciprocalSpaceMap
+
+  constructor() {
+    this.unit_cell = null;
+    this.grid = null;
+    this.stats = { mean: 0.0, rms: 1.0 };
+    this.block = new Block();
+  }
+
+  abs_level(sigma) {
+    return sigma * this.stats.rms + this.stats.mean;
+  }
+
+  from_ccp4(buf, expand_symmetry, gemmi) {
+    if (expand_symmetry === undefined) expand_symmetry = true;
+    if (gemmi == null || typeof gemmi.readCcp4Map !== 'function') {
+      throw Error('Gemmi is required for CCP4 map loading.');
+    }
+    const ccp4 = gemmi.readCcp4Map(buf, expand_symmetry);
+    try {
+      this.set_from_ccp4_map(ccp4);
+    } finally {
+      ccp4.delete();
+    }
+  }
+
+  // DSN6 MAP FORMAT
+  // http://www.uoxray.uoregon.edu/tnt/manual/node104.html
+  // Density values are stored as bytes.
+  from_dsn6(buf) {
+    //console.log('buf type: ' + Object.prototype.toString.call(buf));
+    const u8data = new Uint8Array(buf);
+    const iview = new Int16Array(u8data.buffer);
+    if (iview[18] !== 100) {
+      const len = iview.length;  // or only header, 256?
+      for (let n = 0; n < len; n++) {
+        // swapping bytes with Uint8Array like this:
+        // var tmp=u8data[n*2]; u8data[n*2]=u8data[n*2+1]; u8data[n*2+1]=tmp;
+        // was slowing down this whole function 5x times (!?) on V8.
+        const val = iview[n];
+        iview[n] = ((val & 0xff) << 8) | ((val >> 8) & 0xff);
+      }
+    }
+    if (iview[18] !== 100) {
+      throw Error('Endian swap failed');
+    }
+    const origin = [iview[0], iview[1], iview[2]];
+    const n_real = [iview[3], iview[4], iview[5]];
+    const n_grid = [iview[6], iview[7], iview[8]];
+    const cell_mult = 1.0 / iview[17];
+    this.unit_cell = new UnitCell(cell_mult * iview[9],
+                                  cell_mult * iview[10],
+                                  cell_mult * iview[11],
+                                  cell_mult * iview[12],
+                                  cell_mult * iview[13],
+                                  cell_mult * iview[14]);
+    const grid = new GridArray(n_grid);
+    const prod = iview[15] / 100;
+    const plus = iview[16];
+    //var data_scale_factor = iview[15] / iview[18] + iview[16];
+    // bricks have 512 (8x8x8) values
+    let offset = 512;
+    const n_blocks = [Math.ceil(n_real[0] / 8),
+                      Math.ceil(n_real[1] / 8),
+                      Math.ceil(n_real[2] / 8)];
+    for (let zz = 0; zz < n_blocks[2]; zz++) {
+      for (let yy = 0; yy < n_blocks[1]; yy++) {
+        for (let xx = 0; xx < n_blocks[0]; xx++) { // loop over bricks
+          for (let k = 0; k < 8; k++) {
+            const z = 8 * zz + k;
+            for (let j = 0; j < 8; j++) {
+              const y = 8 * yy + j;
+              for (let i = 0; i < 8; i++) { // loop inside brick
+                const x = 8 * xx + i;
+                if (x < n_real[0] && y < n_real[1] && z < n_real[2]) {
+                  const density = (u8data[offset] - plus) / prod;
+                  offset++;
+                  grid.set_grid_value(origin[0] + x,
+                                      origin[1] + y,
+                                      origin[2] + z, density);
+                } else {
+                  offset += 8 - i;
+                  break;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    this.stats = calculate_stddev(grid.values, 0);
+    this.grid = grid;
+    //this.show_debug_info();
+  }
+
+  show_debug_info() {
+    console.log('unit cell:', this.unit_cell && this.unit_cell.parameters);
+    console.log('grid:', this.grid && this.grid.dim);
+  }
+
+  // Extract a block of density for calculating an isosurface using the
+  // separate marching cubes implementation.
+  extract_block(radius, center) {
+    const grid = this.grid;
+    const unit_cell = this.unit_cell;
+    if (grid == null || unit_cell == null) return;
+    const fc = unit_cell.fractionalize(center);
+    const r = [radius / unit_cell.parameters[0],
+               radius / unit_cell.parameters[1],
+               radius / unit_cell.parameters[2]];
+    const grid_min = grid.frac2grid([fc[0] - r[0], fc[1] - r[1], fc[2] - r[2]]);
+    const grid_max = grid.frac2grid([fc[0] + r[0], fc[1] + r[1], fc[2] + r[2]]);
+    const size = [grid_max[0] - grid_min[0] + 1,
+                        grid_max[1] - grid_min[1] + 1,
+                        grid_max[2] - grid_min[2] + 1];
+    const points = [];
+    const values = [];
+    for (let i = grid_min[0]; i <= grid_max[0]; i++) {
+      for (let j = grid_min[1]; j <= grid_max[1]; j++) {
+        for (let k = grid_min[2]; k <= grid_max[2]; k++) {
+          const frac = grid.grid2frac(i, j, k);
+          const orth = unit_cell.orthogonalize(frac);
+          points.push(orth);
+          const map_value = grid.get_grid_value(i, j, k);
+          values.push(map_value);
+        }
+      }
+    }
+    this.block.set(points, values, size);
+  }
+
+  isomesh_in_block(sigma, method) {
+    const abs_level = this.abs_level(sigma);
+    return this.block.isosurface(abs_level, method);
+  }
+
+   set_from_ccp4_map(ccp4) {
+    const cell = ccp4.cell;
+    this.unit_cell = new UnitCell(cell.a, cell.b, cell.c,
+                                  cell.alpha, cell.beta, cell.gamma);
+    this.stats.mean = ccp4.mean;
+    this.stats.rms = ccp4.rms;
+    const dim = [ccp4.nx, ccp4.ny, ccp4.nz];
+    const grid = new GridArray(dim);
+    const values = ccp4.data();
+    for (let x = 0; x < dim[0]; ++x) {
+      for (let y = 0; y < dim[1]; ++y) {
+        for (let z = 0; z < dim[2]; ++z) {
+          const src = (z * dim[1] + y) * dim[0] + x;
+          grid.values[grid.grid2index_unchecked(x, y, z)] = values[src];
+        }
+      }
+    }
+    this.grid = grid;
+  }
+
+}
+
+ElMap.prototype.unit = 'e/\u212B\u00B3';
+
+// Copyright 2010-2023 Three.js Authors
+// SPDX-License-Identifier: MIT
+
+const _lut = [
+  '00', '01', '02', '03', '04', '05', '06', '07', '08', '09', '0a', '0b', '0c',
+  '0d', '0e', '0f', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19',
+  '1a', '1b', '1c', '1d', '1e', '1f', '20', '21', '22', '23', '24', '25', '26',
+  '27', '28', '29', '2a', '2b', '2c', '2d', '2e', '2f', '30', '31', '32', '33',
+  '34', '35', '36', '37', '38', '39', '3a', '3b', '3c', '3d', '3e', '3f', '40',
+  '41', '42', '43', '44', '45', '46', '47', '48', '49', '4a', '4b', '4c', '4d',
+  '4e', '4f', '50', '51', '52', '53', '54', '55', '56', '57', '58', '59', '5a',
+  '5b', '5c', '5d', '5e', '5f', '60', '61', '62', '63', '64', '65', '66', '67',
+  '68', '69', '6a', '6b', '6c', '6d', '6e', '6f', '70', '71', '72', '73', '74',
+  '75', '76', '77', '78', '79', '7a', '7b', '7c', '7d', '7e', '7f', '80', '81',
+  '82', '83', '84', '85', '86', '87', '88', '89', '8a', '8b', '8c', '8d', '8e',
+  '8f', '90', '91', '92', '93', '94', '95', '96', '97', '98', '99', '9a', '9b',
+  '9c', '9d', '9e', '9f', 'a0', 'a1', 'a2', 'a3', 'a4', 'a5', 'a6', 'a7', 'a8',
+  'a9', 'aa', 'ab', 'ac', 'ad', 'ae', 'af', 'b0', 'b1', 'b2', 'b3', 'b4', 'b5',
+  'b6', 'b7', 'b8', 'b9', 'ba', 'bb', 'bc', 'bd', 'be', 'bf', 'c0', 'c1', 'c2',
+  'c3', 'c4', 'c5', 'c6', 'c7', 'c8', 'c9', 'ca', 'cb', 'cc', 'cd', 'ce', 'cf',
+  'd0', 'd1', 'd2', 'd3', 'd4', 'd5', 'd6', 'd7', 'd8', 'd9', 'da', 'db', 'dc',
+  'dd', 'de', 'df', 'e0', 'e1', 'e2', 'e3', 'e4', 'e5', 'e6', 'e7', 'e8', 'e9',
+  'ea', 'eb', 'ec', 'ed', 'ee', 'ef', 'f0', 'f1', 'f2', 'f3', 'f4', 'f5', 'f6',
+  'f7', 'f8', 'f9', 'fa', 'fb', 'fc', 'fd', 'fe', 'ff'
+];
+
+// http://stackoverflow.com/questions/105034/how-to-create-a-guid-uuid-in-javascript/21963136#21963136
+function generateUUID() {
+  const d0 = (Math.random() * 0xffffffff) | 0;
+  const d1 = (Math.random() * 0xffffffff) | 0;
+  const d2 = (Math.random() * 0xffffffff) | 0;
+  const d3 = (Math.random() * 0xffffffff) | 0;
+  const uuid =
+    _lut[d0 & 0xff] + _lut[(d0 >> 8) & 0xff] +
+    _lut[(d0 >> 16) & 0xff] + _lut[(d0 >> 24) & 0xff] + '-' +
+    _lut[d1 & 0xff] + _lut[(d1 >> 8) & 0xff] + '-' +
+    _lut[((d1 >> 16) & 0x0f) | 0x40] + _lut[(d1 >> 24) & 0xff] + '-' +
+    _lut[(d2 & 0x3f) | 0x80] + _lut[(d2 >> 8) & 0xff] + '-' +
+    _lut[(d2 >> 16) & 0xff] + _lut[(d2 >> 24) & 0xff] + _lut[d3 & 0xff] +
+    _lut[(d3 >> 8) & 0xff] + _lut[(d3 >> 16) & 0xff] + _lut[(d3 >> 24) & 0xff];
+  // .toLowerCase() here flattens concatenated strings to save heap memory space.
+  return uuid.toLowerCase();
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+// compute euclidean modulo of m % n
+// https://en.wikipedia.org/wiki/Modulo_operation
+function euclideanModulo(n, m) {
+  return ((n % m) + m) % m;
+}
+
+
+class Quaternion {
+  constructor(x = 0, y = 0, z = 0, w = 1) {
+    this._x = x;
+    this._y = y;
+    this._z = z;
+    this._w = w;
+  }
+
+  get x() {
+    return this._x;
+  }
+
+  get y() {
+    return this._y;
+  }
+
+  get z() {
+    return this._z;
+  }
+
+  get w() {
+    return this._w;
+  }
+
+  setFromAxisAngle(axis, angle) {
+    // http://www.euclideanspace.com/maths/geometry/rotations/conversions/angleToQuaternion/index.htm
+    // assumes axis is normalized
+    let halfAngle = angle / 2, s = Math.sin(halfAngle);
+
+    this._x = axis.x * s;
+    this._y = axis.y * s;
+    this._z = axis.z * s;
+    this._w = Math.cos(halfAngle);
+
+    return this;
+  }
+
+  setFromRotationMatrix(m) {
+    // http://www.euclideanspace.com/maths/geometry/rotations/conversions/matrixToQuaternion/index.htm
+    // assumes the upper 3x3 of m is a pure rotation matrix (i.e, unscaled)
+
+    const te = m.elements,
+
+      m11 = te[0], m12 = te[4], m13 = te[8],
+      m21 = te[1], m22 = te[5], m23 = te[9],
+      m31 = te[2], m32 = te[6], m33 = te[10],
+
+      trace = m11 + m22 + m33;
+
+    if (trace > 0) {
+      const s = 0.5 / Math.sqrt(trace + 1.0);
+
+      this._w = 0.25 / s;
+      this._x = (m32 - m23) * s;
+      this._y = (m13 - m31) * s;
+      this._z = (m21 - m12) * s;
+    } else if (m11 > m22 && m11 > m33) {
+      const s = 2.0 * Math.sqrt(1.0 + m11 - m22 - m33);
+
+      this._w = (m32 - m23) / s;
+      this._x = 0.25 * s;
+      this._y = (m12 + m21) / s;
+      this._z = (m13 + m31) / s;
+    } else if (m22 > m33) {
+      const s = 2.0 * Math.sqrt(1.0 + m22 - m11 - m33);
+
+      this._w = (m13 - m31) / s;
+      this._x = (m12 + m21) / s;
+      this._y = 0.25 * s;
+      this._z = (m23 + m32) / s;
+    } else {
+      const s = 2.0 * Math.sqrt(1.0 + m33 - m11 - m22);
+
+      this._w = (m21 - m12) / s;
+      this._x = (m13 + m31) / s;
+      this._y = (m23 + m32) / s;
+      this._z = 0.25 * s;
+    }
+
+    return this;
+  }
+
+  setFromUnitVectors(vFrom, vTo) {
+    // assumes direction vectors vFrom and vTo are normalized
+    let r = vFrom.dot(vTo) + 1;
+    if (r < 1e-8) {
+      // vFrom and vTo point in opposite directions
+      r = 0;
+      if (Math.abs(vFrom.x) > Math.abs(vFrom.z)) {
+        this._x = -vFrom.y;
+        this._y = vFrom.x;
+        this._z = 0;
+        this._w = r;
+      } else {
+        this._x = 0;
+        this._y = -vFrom.z;
+        this._z = vFrom.y;
+        this._w = r;
+      }
+    } else {
+      // crossVectors( vFrom, vTo ); // inlined to avoid cyclic dependency on Vector3
+      this._x = vFrom.y * vTo.z - vFrom.z * vTo.y;
+      this._y = vFrom.z * vTo.x - vFrom.x * vTo.z;
+      this._z = vFrom.x * vTo.y - vFrom.y * vTo.x;
+      this._w = r;
+    }
+    return this.normalize();
+  }
+
+  length() {
+    return Math.sqrt(this._x * this._x + this._y * this._y +
+                     this._z * this._z + this._w * this._w);
+  }
+
+  normalize() {
+    let l = this.length();
+    if (l === 0) {
+      this._x = 0;
+      this._y = 0;
+      this._z = 0;
+      this._w = 1;
+    } else {
+      l = 1 / l;
+      this._x = this._x * l;
+      this._y = this._y * l;
+      this._z = this._z * l;
+      this._w = this._w * l;
+    }
+    return this;
+  }
+}
+
+
+class Vector3 {
+  constructor(x = 0, y = 0, z = 0) {
+    Vector3.prototype.isVector3 = true;
+    this.x = x;
+    this.y = y;
+    this.z = z;
+  }
+
+  set(x, y, z) {
+    if (z === undefined) z = this.z; // sprite.scale.set(x,y)
+    this.x = x;
+    this.y = y;
+    this.z = z;
+    return this;
+  }
+
+  clone() {
+    return new this.constructor(this.x, this.y, this.z);
+  }
+
+  copy(v) {
+    this.x = v.x;
+    this.y = v.y;
+    this.z = v.z;
+    return this;
+  }
+
+  add(v) {
+    this.x += v.x;
+    this.y += v.y;
+    this.z += v.z;
+    return this;
+  }
+
+  addVectors(a, b) {
+    this.x = a.x + b.x;
+    this.y = a.y + b.y;
+    this.z = a.z + b.z;
+    return this;
+  }
+
+  addScaledVector(v, s) {
+    this.x += v.x * s;
+    this.y += v.y * s;
+    this.z += v.z * s;
+    return this;
+  }
+
+  sub(v) {
+    this.x -= v.x;
+    this.y -= v.y;
+    this.z -= v.z;
+    return this;
+  }
+
+  subVectors(a, b) {
+    this.x = a.x - b.x;
+    this.y = a.y - b.y;
+    this.z = a.z - b.z;
+    return this;
+  }
+
+  multiplyScalar(scalar) {
+    this.x *= scalar;
+    this.y *= scalar;
+    this.z *= scalar;
+    return this;
+  }
+
+  applyMatrix4(m) {
+    const x = this.x, y = this.y, z = this.z;
+    const e = m.elements;
+    const w = 1 / (e[3] * x + e[7] * y + e[11] * z + e[15]);
+    this.x = (e[0] * x + e[4] * y + e[8] * z + e[12]) * w;
+    this.y = (e[1] * x + e[5] * y + e[9] * z + e[13]) * w;
+    this.z = (e[2] * x + e[6] * y + e[10] * z + e[14]) * w;
+    return this;
+  }
+
+  applyQuaternion(q) {
+    // quaternion q is assumed to have unit length
+    const vx = this.x, vy = this.y, vz = this.z;
+    const qx = q.x, qy = q.y, qz = q.z, qw = q.w;
+    // t = 2 * cross( q.xyz, v );
+    const tx = 2 * (qy * vz - qz * vy);
+    const ty = 2 * (qz * vx - qx * vz);
+    const tz = 2 * (qx * vy - qy * vx);
+    // v + q.w * t + cross( q.xyz, t );
+    this.x = vx + qw * tx + qy * tz - qz * ty;
+    this.y = vy + qw * ty + qz * tx - qx * tz;
+    this.z = vz + qw * tz + qx * ty - qy * tx;
+    return this;
+  }
+
+  unproject(camera) {
+    return this.applyMatrix4(camera.projectionMatrixInverse).applyMatrix4(camera.matrixWorld);
+  }
+
+  transformDirection(m) {
+    // input: THREE.Matrix4 affine matrix
+    // vector interpreted as a direction
+
+    const x = this.x, y = this.y, z = this.z;
+    const e = m.elements;
+
+    this.x = e[0] * x + e[4] * y + e[8] * z;
+    this.y = e[1] * x + e[5] * y + e[9] * z;
+    this.z = e[2] * x + e[6] * y + e[10] * z;
+
+    return this.normalize();
+  }
+
+  divideScalar(scalar) {
+    return this.multiplyScalar(1 / scalar);
+  }
+
+  dot(v) {
+    return this.x * v.x + this.y * v.y + this.z * v.z;
+  }
+
+  lengthSq() {
+    return this.x * this.x + this.y * this.y + this.z * this.z;
+  }
+
+  length() {
+    return Math.sqrt(this.x * this.x + this.y * this.y + this.z * this.z);
+  }
+
+  normalize() {
+    return this.divideScalar(this.length() || 1);
+  }
+
+  setLength(length) {
+    return this.normalize().multiplyScalar(length);
+  }
+
+  lerp(v, alpha) {
+    this.x += (v.x - this.x) * alpha;
+    this.y += (v.y - this.y) * alpha;
+    this.z += (v.z - this.z) * alpha;
+    return this;
+  }
+
+  cross(v) {
+    return this.crossVectors(this, v);
+  }
+
+  crossVectors(a, b) {
+    const ax = a.x, ay = a.y, az = a.z;
+    const bx = b.x, by = b.y, bz = b.z;
+    this.x = ay * bz - az * by;
+    this.y = az * bx - ax * bz;
+    this.z = ax * by - ay * bx;
+    return this;
+  }
+
+  projectOnVector(v) {
+    const denominator = v.lengthSq();
+    if (denominator === 0) return this.set(0, 0, 0);
+    const scalar = v.dot(this) / denominator;
+    return this.copy(v).multiplyScalar(scalar);
+  }
+
+  projectOnPlane(planeNormal) {
+    _vector.copy(this).projectOnVector(planeNormal);
+    return this.sub(_vector);
+  }
+
+  distanceTo(v) {
+    return Math.sqrt(this.distanceToSquared(v));
+  }
+
+  distanceToSquared(v) {
+    const dx = this.x - v.x, dy = this.y - v.y, dz = this.z - v.z;
+    return dx * dx + dy * dy + dz * dz;
+  }
+
+  setFromMatrixPosition(m) {
+    const e = m.elements;
+    this.x = e[12];
+    this.y = e[13];
+    this.z = e[14];
+    return this;
+  }
+
+  setFromMatrixColumn(m, index) {
+    return this.fromArray(m.elements, index * 4);
+  }
+
+  equals(v) {
+    return v.x === this.x && v.y === this.y && v.z === this.z;
+  }
+
+  fromArray(array, offset = 0) {
+    this.x = array[offset];
+    this.y = array[offset + 1];
+    this.z = array[offset + 2];
+    return this;
+  }
+}
+const _vector = /*@__PURE__*/ new Vector3();
+
+
+class Vector4 {
+  constructor(x = 0, y = 0, z = 0, w = 1) {
+    this.x = x;
+    this.y = y;
+    this.z = z;
+    this.w = w;
+  }
+
+  set(x, y, z, w) {
+    this.x = x;
+    this.y = y;
+    this.z = z;
+    this.w = w;
+    return this;
+  }
+
+  copy(v) {
+    this.x = v.x;
+    this.y = v.y;
+    this.z = v.z;
+    this.w = v.w !== undefined ? v.w : 1;
+    return this;
+  }
+
+  multiplyScalar(scalar) {
+    this.x *= scalar;
+    this.y *= scalar;
+    this.z *= scalar;
+    this.w *= scalar;
+    return this;
+  }
+
+  equals(v) {
+    return v.x === this.x && v.y === this.y && v.z === this.z && v.w === this.w;
+  }
+}
+
+
+class Matrix4 {
+  constructor() {
+    this.elements = [
+      1, 0, 0, 0,
+      0, 1, 0, 0,
+      0, 0, 1, 0,
+      0, 0, 0, 1,
+    ];
+  }
+
+  set(n11, n12, n13, n14, n21, n22, n23, n24, n31, n32, n33, n34, n41, n42, n43, n44) {
+    const te = this.elements;
+    te[0] = n11; te[4] = n12; te[8] = n13; te[12] = n14;
+    te[1] = n21; te[5] = n22; te[9] = n23; te[13] = n24;
+    te[2] = n31; te[6] = n32; te[10] = n33; te[14] = n34;
+    te[3] = n41; te[7] = n42; te[11] = n43; te[15] = n44;
+    return this;
+  }
+
+  copy(m) {
+    const te = this.elements;
+    const me = m.elements;
+
+    te[0] = me[0];
+    te[1] = me[1];
+    te[2] = me[2];
+    te[3] = me[3];
+    te[4] = me[4];
+    te[5] = me[5];
+    te[6] = me[6];
+    te[7] = me[7];
+    te[8] = me[8];
+    te[9] = me[9];
+    te[10] = me[10];
+    te[11] = me[11];
+    te[12] = me[12];
+    te[13] = me[13];
+    te[14] = me[14];
+    te[15] = me[15];
+
+    return this;
+  }
+
+  makeRotationFromQuaternion(q) {
+    return this.compose(_zero, q, _one);
+  }
+
+  compose(position, quaternion, scale) {
+    const te = this.elements;
+
+    const x = quaternion._x, y = quaternion._y, z = quaternion._z, w = quaternion._w;
+    const x2 = x + x, y2 = y + y, z2 = z + z;
+    const xx = x * x2, xy = x * y2, xz = x * z2;
+    const yy = y * y2, yz = y * z2, zz = z * z2;
+    const wx = w * x2, wy = w * y2, wz = w * z2;
+
+    const sx = scale.x, sy = scale.y, sz = scale.z;
+
+    te[0] = (1 - (yy + zz)) * sx;
+    te[1] = (xy + wz) * sx;
+    te[2] = (xz - wy) * sx;
+    te[3] = 0;
+
+    te[4] = (xy - wz) * sy;
+    te[5] = (1 - (xx + zz)) * sy;
+    te[6] = (yz + wx) * sy;
+    te[7] = 0;
+
+    te[8] = (xz + wy) * sz;
+    te[9] = (yz - wx) * sz;
+    te[10] = (1 - (xx + yy)) * sz;
+    te[11] = 0;
+
+    te[12] = position.x;
+    te[13] = position.y;
+    te[14] = position.z;
+    te[15] = 1;
+
+    return this;
+  }
+
+  lookAt(eye, target, up) {
+    const te = this.elements;
+
+    _z.subVectors(eye, target);
+
+    if (_z.lengthSq() === 0) {
+      // eye and target are in the same position
+
+      _z.z = 1;
+    }
+
+    _z.normalize();
+    _x.crossVectors(up, _z);
+
+    if (_x.lengthSq() === 0) {
+      // up and z are parallel
+
+      if (Math.abs(up.z) === 1) {
+        _z.x += 0.0001;
+      } else {
+        _z.z += 0.0001;
+      }
+
+      _z.normalize();
+      _x.crossVectors(up, _z);
+    }
+
+    _x.normalize();
+    _y.crossVectors(_z, _x);
+
+    te[0] = _x.x; te[4] = _y.x; te[8] = _z.x;
+    te[1] = _x.y; te[5] = _y.y; te[9] = _z.y;
+    te[2] = _x.z; te[6] = _y.z; te[10] = _z.z;
+
+    return this;
+  }
+
+  multiplyMatrices(a, b) {
+    const ae = a.elements;
+    const be = b.elements;
+    const te = this.elements;
+
+    const a11 = ae[0], a12 = ae[4], a13 = ae[8], a14 = ae[12];
+    const a21 = ae[1], a22 = ae[5], a23 = ae[9], a24 = ae[13];
+    const a31 = ae[2], a32 = ae[6], a33 = ae[10], a34 = ae[14];
+    const a41 = ae[3], a42 = ae[7], a43 = ae[11], a44 = ae[15];
+
+    const b11 = be[0], b12 = be[4], b13 = be[8], b14 = be[12];
+    const b21 = be[1], b22 = be[5], b23 = be[9], b24 = be[13];
+    const b31 = be[2], b32 = be[6], b33 = be[10], b34 = be[14];
+    const b41 = be[3], b42 = be[7], b43 = be[11], b44 = be[15];
+
+    te[0] = a11 * b11 + a12 * b21 + a13 * b31 + a14 * b41;
+    te[4] = a11 * b12 + a12 * b22 + a13 * b32 + a14 * b42;
+    te[8] = a11 * b13 + a12 * b23 + a13 * b33 + a14 * b43;
+    te[12] = a11 * b14 + a12 * b24 + a13 * b34 + a14 * b44;
+
+    te[1] = a21 * b11 + a22 * b21 + a23 * b31 + a24 * b41;
+    te[5] = a21 * b12 + a22 * b22 + a23 * b32 + a24 * b42;
+    te[9] = a21 * b13 + a22 * b23 + a23 * b33 + a24 * b43;
+    te[13] = a21 * b14 + a22 * b24 + a23 * b34 + a24 * b44;
+
+    te[2] = a31 * b11 + a32 * b21 + a33 * b31 + a34 * b41;
+    te[6] = a31 * b12 + a32 * b22 + a33 * b32 + a34 * b42;
+    te[10] = a31 * b13 + a32 * b23 + a33 * b33 + a34 * b43;
+    te[14] = a31 * b14 + a32 * b24 + a33 * b34 + a34 * b44;
+
+    te[3] = a41 * b11 + a42 * b21 + a43 * b31 + a44 * b41;
+    te[7] = a41 * b12 + a42 * b22 + a43 * b32 + a44 * b42;
+    te[11] = a41 * b13 + a42 * b23 + a43 * b33 + a44 * b43;
+    te[15] = a41 * b14 + a42 * b24 + a43 * b34 + a44 * b44;
+
+    return this;
+  }
+
+  setPosition(x, y, z) {
+    const te = this.elements;
+
+    if (x.isVector3) {
+      te[12] = x.x;
+      te[13] = x.y;
+      te[14] = x.z;
+    } else {
+      te[12] = x;
+      te[13] = y;
+      te[14] = z;
+    }
+    return this;
+  }
+
+  invert() {
+    // based on https://github.com/toji/gl-matrix
+    const te = this.elements,
+      n11 = te[0], n21 = te[1], n31 = te[2], n41 = te[3],
+      n12 = te[4], n22 = te[5], n32 = te[6], n42 = te[7],
+      n13 = te[8], n23 = te[9], n33 = te[10], n43 = te[11],
+      n14 = te[12], n24 = te[13], n34 = te[14], n44 = te[15],
+      t1 = n11 * n22 - n21 * n12,
+      t2 = n11 * n32 - n31 * n12,
+      t3 = n11 * n42 - n41 * n12,
+      t4 = n21 * n32 - n31 * n22,
+      t5 = n21 * n42 - n41 * n22,
+      t6 = n31 * n42 - n41 * n32,
+      t7 = n13 * n24 - n23 * n14,
+      t8 = n13 * n34 - n33 * n14,
+      t9 = n13 * n44 - n43 * n14,
+      t10 = n23 * n34 - n33 * n24,
+      t11 = n23 * n44 - n43 * n24,
+      t12 = n33 * n44 - n43 * n34;
+
+    const det = t1 * t12 - t2 * t11 + t3 * t10 + t4 * t9 - t5 * t8 + t6 * t7;
+
+    if (det === 0) return this.set(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+
+    const detInv = 1 / det;
+
+    te[0] = (n22 * t12 - n32 * t11 + n42 * t10) * detInv;
+    te[1] = (n31 * t11 - n21 * t12 - n41 * t10) * detInv;
+    te[2] = (n24 * t6 - n34 * t5 + n44 * t4) * detInv;
+    te[3] = (n33 * t5 - n23 * t6 - n43 * t4) * detInv;
+
+    te[4] = (n32 * t9 - n12 * t12 - n42 * t8) * detInv;
+    te[5] = (n11 * t12 - n31 * t9 + n41 * t8) * detInv;
+    te[6] = (n34 * t3 - n14 * t6 - n44 * t2) * detInv;
+    te[7] = (n13 * t6 - n33 * t3 + n43 * t2) * detInv;
+
+    te[8] = (n12 * t11 - n22 * t9 + n42 * t7) * detInv;
+    te[9] = (n21 * t9 - n11 * t11 - n41 * t7) * detInv;
+    te[10] = (n14 * t5 - n24 * t3 + n44 * t1) * detInv;
+    te[11] = (n23 * t3 - n13 * t5 - n43 * t1) * detInv;
+
+    te[12] = (n22 * t8 - n12 * t10 - n32 * t7) * detInv;
+    te[13] = (n11 * t10 - n21 * t8 + n31 * t7) * detInv;
+    te[14] = (n24 * t2 - n14 * t4 - n34 * t1) * detInv;
+    te[15] = (n13 * t4 - n23 * t2 + n33 * t1) * detInv;
+
+    return this;
+  }
+
+  scale(v) {
+    const te = this.elements;
+    const x = v.x, y = v.y, z = v.z;
+
+    te[0] *= x; te[4] *= y; te[8] *= z;
+    te[1] *= x; te[5] *= y; te[9] *= z;
+    te[2] *= x; te[6] *= y; te[10] *= z;
+    te[3] *= x; te[7] *= y; te[11] *= z;
+
+    return this;
+  }
+
+  getMaxScaleOnAxis() {
+    const te = this.elements;
+
+    const scaleXSq = te[0] * te[0] + te[1] * te[1] + te[2] * te[2];
+    const scaleYSq = te[4] * te[4] + te[5] * te[5] + te[6] * te[6];
+    const scaleZSq = te[8] * te[8] + te[9] * te[9] + te[10] * te[10];
+
+    return Math.sqrt(Math.max(scaleXSq, scaleYSq, scaleZSq));
+  }
+
+  makeOrthographic(left, right, top, bottom, near, far) {
+    let te = this.elements;
+    let w = 1.0 / (right - left);
+    let h = 1.0 / (top - bottom);
+    let p = 1.0 / (far - near);
+
+    let x = (right + left) * w;
+    let y = (top + bottom) * h;
+    let z = (far + near) * p;
+
+    te[0] = 2 * w; te[4] = 0; te[8] = 0; te[12] = -x;
+    te[1] = 0; te[5] = 2 * h; te[9] = 0; te[13] = -y;
+    te[2] = 0; te[6] = 0; te[10] = -2 * p; te[14] = -z;
+    te[3] = 0; te[7] = 0; te[11] = 0; te[15] = 1;
+
+    return this;
+  }
+}
+
+const _zero = /*@__PURE__*/ new Vector3(0, 0, 0);
+const _one = /*@__PURE__*/ new Vector3(1, 1, 1);
+const _x = /*@__PURE__*/ new Vector3();
+const _y = /*@__PURE__*/ new Vector3();
+const _z = /*@__PURE__*/ new Vector3();
+
+
+function hue2rgb(p, q, t) {
+  if (t < 0) t += 1;
+  if (t > 1) t -= 1;
+  if (t < 1 / 6) return p + (q - p) * 6 * t;
+  if (t < 1 / 2) return q;
+  if (t < 2 / 3) return p + (q - p) * 6 * (2 / 3 - t);
+  return p;
+}
+
+class Color {
+  constructor(r, g, b) {
+    this.isColor = true;
+    this.r = 1;
+    this.g = 1;
+    this.b = 1;
+    return this.set(r, g, b);
+  }
+
+  set(r, g, b) {
+    if (g === undefined && b === undefined) {
+      // r is THREE.Color, hex or string
+      const value = r;
+      if (value && value.isColor) {
+        this.copy(value);
+      } else if (typeof value === 'number') {
+        this.setHex(value);
+      }
+    } else {
+      this.setRGB(r, g, b);
+    }
+    return this;
+  }
+
+  setHex(hex) {
+    hex = Math.floor(hex);
+    this.r = ((hex >> 16) & 255) / 255;
+    this.g = ((hex >> 8) & 255) / 255;
+    this.b = (hex & 255) / 255;
+    return this;
+  }
+
+  setRGB(r, g, b) {
+    this.r = r;
+    this.g = g;
+    this.b = b;
+    return this;
+  }
+
+  setHSL(h, s, l) {
+    // h,s,l ranges are in 0.0 - 1.0
+    h = euclideanModulo(h, 1);
+    s = clamp(s, 0, 1);
+    l = clamp(l, 0, 1);
+
+    if (s === 0) {
+      this.r = this.g = this.b = l;
+    } else {
+      const p = l <= 0.5 ? l * (1 + s) : l + s - l * s;
+      const q = 2 * l - p;
+
+      this.r = hue2rgb(q, p, h + 1 / 3);
+      this.g = hue2rgb(q, p, h);
+      this.b = hue2rgb(q, p, h - 1 / 3);
+    }
+    return this;
+  }
+
+  getHSL(target) {
+    // h,s,l ranges are in 0.0 - 1.0
+
+    const r = this.r, g = this.g, b = this.b;
+
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+
+    let hue, saturation;
+    const lightness = (min + max) / 2.0;
+
+    if (min === max) {
+      hue = 0;
+      saturation = 0;
+    } else {
+      const delta = max - min;
+
+      saturation = lightness <= 0.5 ? delta / (max + min) : delta / (2 - max - min);
+
+      switch (max) {
+        case r:
+          hue = (g - b) / delta + (g < b ? 6 : 0);
+          break;
+        case g:
+          hue = (b - r) / delta + 2;
+          break;
+        case b:
+          hue = (r - g) / delta + 4;
+          break;
+      }
+
+      hue /= 6;
+    }
+    target.h = hue;
+    target.s = saturation;
+    target.l = lightness;
+
+    return target;
+  }
+
+  clone() {
+    return new this.constructor(this.r, this.g, this.b);
+  }
+
+  copy(color) {
+    this.r = color.r;
+    this.g = color.g;
+    this.b = color.b;
+
+    return this;
+  }
+
+  getHex() {
+    return ( this.r * 255 ) << 16 ^ ( this.g * 255 ) << 8 ^ ( this.b * 255 ) << 0;
+  }
+
+  getHexString() {
+    return ('000000' + this.getHex().toString(16)).slice(-6);
+  }
+}
+
+
+//const _vector is already defined above
+const _segCenter = /*@__PURE__*/ new Vector3();
+const _segDir = /*@__PURE__*/ new Vector3();
+const _diff = /*@__PURE__*/ new Vector3();
+
+class Ray {
+  constructor(origin = new Vector3(), direction = new Vector3(0, 0, -1)) {
+    this.origin = origin;
+    this.direction = direction;
+  }
+
+  copy(ray) {
+    this.origin.copy(ray.origin);
+    this.direction.copy(ray.direction);
+    return this;
+  }
+
+  distanceSqToPoint(point) {
+    const directionDistance = _vector.subVectors(point, this.origin).dot(this.direction);
+    // point behind the ray
+    if (directionDistance < 0) {
+      return this.origin.distanceToSquared(point);
+    }
+    _vector.copy(this.origin).addScaledVector(this.direction, directionDistance);
+    return _vector.distanceToSquared(point);
+  }
+
+  distanceSqToSegment(v0, v1, optionalPointOnRay, optionalPointOnSegment) {
+    // from https://github.com/pmjoniak/GeometricTools/blob/master/GTEngine/Include/Mathematics/GteDistRaySegment.h
+    // It returns the min distance between the ray and the segment
+    // defined by v0 and v1
+    // It can also set two optional targets :
+    // - The closest point on the ray
+    // - The closest point on the segment
+
+    _segCenter.copy(v0).add(v1).multiplyScalar(0.5);
+    _segDir.copy(v1).sub(v0).normalize();
+    _diff.copy(this.origin).sub(_segCenter);
+
+    const segExtent = v0.distanceTo(v1) * 0.5;
+    const a01 = -this.direction.dot(_segDir);
+    const b0 = _diff.dot(this.direction);
+    const b1 = -_diff.dot(_segDir);
+    const c = _diff.lengthSq();
+    const det = Math.abs(1 - a01 * a01);
+    let s0, s1, sqrDist, extDet;
+
+    if (det > 0) {
+      // The ray and segment are not parallel.
+
+      s0 = a01 * b1 - b0;
+      s1 = a01 * b0 - b1;
+      extDet = segExtent * det;
+
+      if (s0 >= 0) {
+        if (s1 >= -extDet) {
+          if (s1 <= extDet) {
+            // region 0
+            // Minimum at interior points of ray and segment.
+
+            const invDet = 1 / det;
+            s0 *= invDet;
+            s1 *= invDet;
+            sqrDist = s0 * (s0 + a01 * s1 + 2 * b0) + s1 * (a01 * s0 + s1 + 2 * b1) + c;
+          } else {
+            // region 1
+
+            s1 = segExtent;
+            s0 = Math.max(0, -(a01 * s1 + b0));
+            sqrDist = -s0 * s0 + s1 * (s1 + 2 * b1) + c;
+          }
+        } else {
+          // region 5
+
+          s1 = -segExtent;
+          s0 = Math.max(0, -(a01 * s1 + b0));
+          sqrDist = -s0 * s0 + s1 * (s1 + 2 * b1) + c;
+        }
+      } else {
+        if (s1 <= -extDet) {
+          // region 4
+
+          s0 = Math.max(0, -(-a01 * segExtent + b0));
+          s1 = s0 > 0 ? -segExtent : Math.min(Math.max(-segExtent, -b1), segExtent);
+          sqrDist = -s0 * s0 + s1 * (s1 + 2 * b1) + c;
+        } else if (s1 <= extDet) {
+          // region 3
+
+          s0 = 0;
+          s1 = Math.min(Math.max(-segExtent, -b1), segExtent);
+          sqrDist = s1 * (s1 + 2 * b1) + c;
+        } else {
+          // region 2
+
+          s0 = Math.max(0, -(a01 * segExtent + b0));
+          s1 = s0 > 0 ? segExtent : Math.min(Math.max(-segExtent, -b1), segExtent);
+          sqrDist = -s0 * s0 + s1 * (s1 + 2 * b1) + c;
+        }
+      }
+    } else {
+      // Ray and segment are parallel.
+
+      s1 = a01 > 0 ? -segExtent : segExtent;
+      s0 = Math.max(0, -(a01 * s1 + b0));
+      sqrDist = -s0 * s0 + s1 * (s1 + 2 * b1) + c;
+    }
+
+    if (optionalPointOnRay) {
+      optionalPointOnRay.copy(this.origin).addScaledVector(this.direction, s0);
+    }
+
+    if (optionalPointOnSegment) {
+      optionalPointOnSegment.copy(_segCenter).addScaledVector(_segDir, s1);
+    }
+
+    return sqrDist;
+  }
+
+  applyMatrix4(matrix4) {
+    this.origin.applyMatrix4(matrix4);
+    this.direction.transformDirection(matrix4);
+    return this;
+  }
+}
+
+// Copyright 2010-2023 Three.js Authors
+// SPDX-License-Identifier: MIT
+
+
+// constants.js
+let NoBlending = 0;
+let NormalBlending = 1;
+
+// core/EventDispatcher.js
+class EventDispatcher {
+  addEventListener(type, listener) {
+    if (this._listeners === undefined) this._listeners = {};
+
+    const listeners = this._listeners;
+
+    if (listeners[type] === undefined) {
+      listeners[type] = [];
+    }
+
+    if (listeners[type].indexOf(listener) === -1) {
+      listeners[type].push(listener);
+    }
+  }
+
+  removeEventListener(type, listener) {
+    if (this._listeners === undefined) return;
+
+    const listeners = this._listeners;
+    const listenerArray = listeners[type];
+
+    if (listenerArray !== undefined) {
+      const index = listenerArray.indexOf(listener);
+
+      if (index !== -1) {
+        listenerArray.splice(index, 1);
+      }
+    }
+  }
+
+  dispatchEvent(event) {
+    if (this._listeners === undefined) return;
+
+    const listeners = this._listeners;
+    const listenerArray = listeners[event.type];
+
+    if (listenerArray !== undefined) {
+      event.target = this;
+
+      // Make a copy, in case listeners are removed while iterating.
+      const array = listenerArray.slice(0);
+
+      for (let i = 0, l = array.length; i < l; i++) {
+        array[i].call(this, event);
+      }
+
+      event.target = null;
+    }
+  }
+}
+
+// textures/Source.js
+let _sourceId = 0;
+class Source {
+  constructor(data = null) {
+    Object.defineProperty(this, 'id', { value: _sourceId++ });
+    this.uuid = generateUUID();
+    this.data = data;
+    this.dataReady = true;
+    this.version = 0;
+  }
+  set needsUpdate( value ) {
+    if (value === true) this.version++;
+  }
+}
+
+// textures/Texture.js
+let _textureId = 0;
+class Texture extends EventDispatcher {
+  constructor(image) {
+    super();
+    Object.defineProperty(this, 'id', { value: _textureId++ });
+    this.uuid = generateUUID();
+    this.name = '';
+    this.source = new Source(image);
+    this.version = 0;
+  }
+
+  get image() {
+    return this.source.data;
+  }
+
+  set image(value) {
+    this.source.data = value;
+  }
+
+  dispose() {
+    this.dispatchEvent({ type: 'dispose' });
+  }
+
+  set needsUpdate(value) {
+    if (value === true) {
+      this.version++;
+      this.source.needsUpdate = true;
+    }
+  }
+}
+
+
+// renderers/webgl/WebGLUniforms.js
+/**
+ * Uniforms of a program.
+ * Those form a tree structure with a special top-level container for the root,
+ * which you get by calling 'new WebGLUniforms( gl, program )'.
+ *
+ *
+ * Properties of inner nodes including the top-level container:
+ *
+ * .seq - array of nested uniforms
+ * .map - nested uniforms by name
+ *
+ *
+ * Methods of all nodes except the top-level container:
+ *
+ * .setValue( gl, value, [textures] )
+ *
+ *              uploads a uniform value(s)
+ *      the 'textures' parameter is needed for sampler uniforms
+ *
+ *
+ * Static methods of the top-level container (textures factorizations):
+ *
+ * .upload( gl, seq, values, textures )
+ *
+ *              sets uniforms in 'seq' to 'values[id].value'
+ *
+ * .seqWithValue( seq, values ) : filteredSeq
+ *
+ *              filters 'seq' entries with corresponding entry in values
+ *
+ *
+ * Methods of the top-level container (textures factorizations):
+ *
+ * .setValue( gl, name, value, textures )
+ *
+ *              sets uniform with  name 'name' to 'value'
+ *
+ * .setOptional( gl, obj, prop )
+ *
+ *              like .set for an optional property of the object
+ *
+ */
+const emptyTexture = /*@__PURE__*/ new Texture();
+
+// --- Utilities ---
+
+// Float32Array caches used for uploading Matrix uniforms
+
+const mat4array = new Float32Array(16);
+const mat3array = new Float32Array(9);
+const mat2array = new Float32Array(4);
+
+function arraysEqual(a, b) {
+  if (a.length !== b.length) return false;
+
+  for (let i = 0, l = a.length; i < l; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+
+  return true;
+}
+
+function copyArray(a, b) {
+  for (let i = 0, l = b.length; i < l; i++) {
+    a[i] = b[i];
+  }
+}
+
+// --- Setters ---
+
+// Note: Defining these methods externally, because they come in a bunch
+// and this way their names minify.
+
+// Single scalar
+function setValueV1f(gl, v) {
+  const cache = this.cache;
+  if (cache[0] === v) return;
+  gl.uniform1f(this.addr, v);
+  cache[0] = v;
+}
+
+// Single float vector (from flat array or THREE.VectorN)
+
+function setValueV2f(gl, v) {
+  const cache = this.cache;
+  if (v.x !== undefined) {
+    if (cache[0] !== v.x || cache[1] !== v.y) {
+      gl.uniform2f(this.addr, v.x, v.y);
+      cache[0] = v.x;
+      cache[1] = v.y;
+    }
+  } else {
+    if (arraysEqual(cache, v)) return;
+    gl.uniform2fv(this.addr, v);
+    copyArray(cache, v);
+  }
+}
+
+function setValueV3f(gl, v) {
+  const cache = this.cache;
+
+  if (v.x !== undefined) {
+    if (cache[0] !== v.x || cache[1] !== v.y || cache[2] !== v.z) {
+      gl.uniform3f(this.addr, v.x, v.y, v.z);
+      cache[0] = v.x;
+      cache[1] = v.y;
+      cache[2] = v.z;
+    }
+  } else if (v.r !== undefined) {
+    if (cache[0] !== v.r || cache[1] !== v.g || cache[2] !== v.b) {
+      gl.uniform3f(this.addr, v.r, v.g, v.b);
+      cache[0] = v.r;
+      cache[1] = v.g;
+      cache[2] = v.b;
+    }
+  } else {
+    if (arraysEqual(cache, v)) return;
+    gl.uniform3fv(this.addr, v);
+    copyArray(cache, v);
+  }
+}
+
+function setValueV4f(gl, v) {
+  const cache = this.cache;
+  if (v.x !== undefined) {
+    if (cache[0] !== v.x || cache[1] !== v.y || cache[2] !== v.z || cache[3] !== v.w) {
+      gl.uniform4f(this.addr, v.x, v.y, v.z, v.w);
+      cache[0] = v.x;
+      cache[1] = v.y;
+      cache[2] = v.z;
+      cache[3] = v.w;
+    }
+  } else {
+    if (arraysEqual(cache, v)) return;
+    gl.uniform4fv(this.addr, v);
+    copyArray(cache, v);
+  }
+}
+
+// Single matrix (from flat array or THREE.MatrixN)
+
+function setValueM2(gl, v) {
+  const cache = this.cache;
+  const elements = v.elements;
+
+  if (elements === undefined) {
+    if (arraysEqual(cache, v)) return;
+    gl.uniformMatrix2fv(this.addr, false, v);
+    copyArray(cache, v);
+  } else {
+    if (arraysEqual(cache, elements)) return;
+    mat2array.set(elements);
+    gl.uniformMatrix2fv(this.addr, false, mat2array);
+    copyArray(cache, elements);
+  }
+}
+
+function setValueM3(gl, v) {
+  const cache = this.cache;
+  const elements = v.elements;
+  if (elements === undefined) {
+    if (arraysEqual(cache, v)) return;
+    gl.uniformMatrix3fv(this.addr, false, v);
+    copyArray(cache, v);
+  } else {
+    if (arraysEqual(cache, elements)) return;
+    mat3array.set(elements);
+    gl.uniformMatrix3fv(this.addr, false, mat3array);
+    copyArray(cache, elements);
+  }
+}
+
+function setValueM4(gl, v) {
+  const cache = this.cache;
+  const elements = v.elements;
+  if (elements === undefined) {
+    if (arraysEqual(cache, v)) return;
+    gl.uniformMatrix4fv(this.addr, false, v);
+    copyArray(cache, v);
+  } else {
+    if (arraysEqual(cache, elements)) return;
+    mat4array.set(elements);
+    gl.uniformMatrix4fv(this.addr, false, mat4array);
+    copyArray(cache, elements);
+  }
+}
+
+// Single integer / boolean
+
+function setValueV1i(gl, v) {
+  const cache = this.cache;
+  if (cache[0] === v) return;
+  gl.uniform1i(this.addr, v);
+  cache[0] = v;
+}
+
+// Single integer / boolean vector (from flat array or THREE.VectorN)
+
+function setValueV2i(gl, v) {
+  const cache = this.cache;
+  if (v.x !== undefined) {
+    if (cache[0] !== v.x || cache[1] !== v.y) {
+      gl.uniform2i(this.addr, v.x, v.y);
+      cache[0] = v.x;
+      cache[1] = v.y;
+    }
+  } else {
+    if (arraysEqual(cache, v)) return;
+    gl.uniform2iv(this.addr, v);
+    copyArray(cache, v);
+  }
+}
+
+function setValueV3i(gl, v) {
+  const cache = this.cache;
+  if (v.x !== undefined) {
+    if (cache[0] !== v.x || cache[1] !== v.y || cache[2] !== v.z) {
+      gl.uniform3i(this.addr, v.x, v.y, v.z);
+      cache[0] = v.x;
+      cache[1] = v.y;
+      cache[2] = v.z;
+    }
+  } else {
+    if (arraysEqual(cache, v)) return;
+    gl.uniform3iv(this.addr, v);
+    copyArray(cache, v);
+  }
+}
+
+function setValueV4i(gl, v) {
+  const cache = this.cache;
+  if (v.x !== undefined) {
+    if (cache[0] !== v.x || cache[1] !== v.y || cache[2] !== v.z || cache[3] !== v.w) {
+      gl.uniform4i(this.addr, v.x, v.y, v.z, v.w);
+      cache[0] = v.x;
+      cache[1] = v.y;
+      cache[2] = v.z;
+      cache[3] = v.w;
+    }
+  } else {
+    if (arraysEqual(cache, v)) return;
+    gl.uniform4iv(this.addr, v);
+    copyArray(cache, v);
+  }
+}
+
+// Single unsigned integer
+function setValueV1ui(gl, v) {
+  const cache = this.cache;
+
+  if (cache[0] === v) return;
+
+  gl.uniform1ui(this.addr, v);
+
+  cache[0] = v;
+}
+
+// Single unsigned integer vector (from flat array or THREE.VectorN)
+
+function setValueV2ui(gl, v) {
+  const cache = this.cache;
+  if (v.x !== undefined) {
+    if (cache[0] !== v.x || cache[1] !== v.y) {
+      gl.uniform2ui(this.addr, v.x, v.y);
+
+      cache[0] = v.x;
+      cache[1] = v.y;
+    }
+  } else {
+    if (arraysEqual(cache, v)) return;
+    gl.uniform2uiv(this.addr, v);
+    copyArray(cache, v);
+  }
+}
+
+function setValueV3ui(gl, v) {
+  const cache = this.cache;
+  if (v.x !== undefined) {
+    if (cache[0] !== v.x || cache[1] !== v.y || cache[2] !== v.z) {
+      gl.uniform3ui(this.addr, v.x, v.y, v.z);
+      cache[0] = v.x;
+      cache[1] = v.y;
+      cache[2] = v.z;
+    }
+  } else {
+    if (arraysEqual(cache, v)) return;
+    gl.uniform3uiv(this.addr, v);
+    copyArray(cache, v);
+  }
+}
+
+function setValueV4ui(gl, v) {
+  const cache = this.cache;
+  if (v.x !== undefined) {
+    if (cache[0] !== v.x || cache[1] !== v.y || cache[2] !== v.z || cache[3] !== v.w) {
+      gl.uniform4ui(this.addr, v.x, v.y, v.z, v.w);
+
+      cache[0] = v.x;
+      cache[1] = v.y;
+      cache[2] = v.z;
+      cache[3] = v.w;
+    }
+  } else {
+    if (arraysEqual(cache, v)) return;
+    gl.uniform4uiv(this.addr, v);
+    copyArray(cache, v);
+  }
+}
+
+// Single texture (2D / Cube)
+
+function setValueT1(gl, v, textures) {
+  const cache = this.cache;
+  const unit = textures.allocateTextureUnit();
+
+  if (cache[0] !== unit) {
+    gl.uniform1i(this.addr, unit);
+    cache[0] = unit;
+  }
+  const emptyTexture2D = emptyTexture;
+  textures.setTexture2D(v || emptyTexture2D, unit);
+}
+
+// Helper to pick the right setter for the singular case
+function getSingularSetter(type) {
+  switch (type) {
+    case 0x1406: return setValueV1f; // FLOAT
+    case 0x8b50: return setValueV2f; // _VEC2
+    case 0x8b51: return setValueV3f; // _VEC3
+    case 0x8b52: return setValueV4f; // _VEC4
+
+    case 0x8b5a: return setValueM2; // _MAT2
+    case 0x8b5b: return setValueM3; // _MAT3
+    case 0x8b5c: return setValueM4; // _MAT4
+
+    case 0x1404: case 0x8b56: return setValueV1i; // INT, BOOL
+    case 0x8b53: case 0x8b57: return setValueV2i; // _VEC2
+    case 0x8b54: case 0x8b58: return setValueV3i; // _VEC3
+    case 0x8b55: case 0x8b59: return setValueV4i; // _VEC4
+
+    case 0x1405: return setValueV1ui; // UINT
+    case 0x8dc6: return setValueV2ui; // _VEC2
+    case 0x8dc7: return setValueV3ui; // _VEC3
+    case 0x8dc8: return setValueV4ui; // _VEC4
+
+    case 0x8b5e: // SAMPLER_2D
+    case 0x8d66: // SAMPLER_EXTERNAL_OES
+    case 0x8dca: // INT_SAMPLER_2D
+    case 0x8dd2: // UNSIGNED_INT_SAMPLER_2D
+      return setValueT1;
+  }
+}
+
+// --- Uniform Classes ---
+
+class SingleUniform {
+  constructor(id, activeInfo, addr) {
+    this.id = id;
+    this.addr = addr;
+    this.cache = [];
+    this.type = activeInfo.type;
+    this.setValue = getSingularSetter(activeInfo.type);
+    // this.path = activeInfo.name; // DEBUG
+  }
+}
+
+class StructuredUniform {
+  constructor(id) {
+    this.id = id;
+    this.seq = [];
+    this.map = {};
+  }
+  setValue(gl, value, textures) {
+    const seq = this.seq;
+    for (let i = 0, n = seq.length; i !== n; ++i) {
+      const u = seq[i];
+      u.setValue(gl, value[u.id], textures);
+    }
+  }
+}
+
+
+// --- Top-level ---
+
+// Parser - builds up the property tree from the path strings
+
+const RePathPart = /(\w+)(\])?(\[|\.)?/g;
+
+// extracts
+//  - the identifier (member name or array index)
+//  - followed by an optional right bracket (found when array index)
+//  - followed by an optional left bracket or dot (type of subscript)
+//
+// Note: These portions can be read in a non-overlapping fashion and
+// allow straightforward parsing of the hierarchy that WebGL encodes
+// in the uniform names.
+
+function addUniform(container, uniformObject) {
+  container.seq.push(uniformObject);
+  container.map[uniformObject.id] = uniformObject;
+}
+
+function parseUniform(activeInfo, addr, container) {
+  const path = activeInfo.name,
+    pathLength = path.length;
+  // reset RegExp object, because of the early exit of a previous run
+  RePathPart.lastIndex = 0;
+  while (true) {
+    const match = RePathPart.exec(path),
+      matchEnd = RePathPart.lastIndex;
+    let id = match[1];
+    const idIsIndex = match[2] === ']',
+      subscript = match[3];
+    if (idIsIndex) id = id | 0; // convert to integer
+    if (subscript === undefined || (subscript === '[' && matchEnd + 2 === pathLength)) {
+      // bare name or "pure" bottom-level array "[0]" suffix
+      if (subscript !== undefined) throw new TypeError('PureArrayUniform?');
+      addUniform(container, new SingleUniform(id, activeInfo, addr));
+      break;
+    } else {
+      // step into inner node / create it in case it doesn't exist
+      const map = container.map;
+      let next = map[id];
+      if (next === undefined) {
+        next = new StructuredUniform(id);
+        addUniform(container, next);
+      }
+      container = next;
+    }
+  }
+}
+
+// Root Container
+
+class WebGLUniforms {
+  constructor(gl, program) {
+    this.seq = [];
+    this.map = {};
+    const n = gl.getProgramParameter(program, gl.ACTIVE_UNIFORMS);
+
+    for (let i = 0; i < n; ++i) {
+      const info = gl.getActiveUniform(program, i),
+        addr = gl.getUniformLocation(program, info.name);
+      parseUniform(info, addr, this);
+    }
+  }
+
+  setValue(gl, name, value, textures) {
+    const u = this.map[name];
+    if (u !== undefined) u.setValue(gl, value, textures);
+  }
+
+  setOptional(gl, object, name) {
+    const v = object[name];
+    if (v !== undefined) this.setValue(gl, name, v);
+  }
+
+  static upload(gl, seq, values, textures) {
+    for (let i = 0, n = seq.length; i !== n; ++i) {
+      const u = seq[i],
+        v = values[u.id];
+      if (v.needsUpdate !== false) {
+        // note: always updating when .needsUpdate is undefined
+        u.setValue(gl, v.value, textures);
+      }
+    }
+  }
+
+  static seqWithValue(seq, values) {
+    const r = [];
+    for (let i = 0, n = seq.length; i !== n; ++i) {
+      const u = seq[i];
+      if (u.id in values) r.push(u);
+    }
+    return r;
+  }
+}
+
+
+
+// materials/Material.js
+let _materialId = 0;
+
+class Material extends EventDispatcher {
+  constructor() {
+    super();
+    this.isMaterial = true;
+    Object.defineProperty(this, 'id', { value: _materialId++ });
+    this.uuid = generateUUID();
+    this.name = '';
+    this.type = 'Material';
+
+    this.opacity = 1;
+    this.transparent = false;
+
+    this.depthTest = true;
+    this.depthWrite = true;
+
+    this.precision = null; // override the renderer's default precision for this material
+
+    this.premultipliedAlpha = false;
+
+    this.visible = true;
+
+    //TODO
+    //this.version = 0;
+    this._needsUpdate = true;
+  }
+
+  setValues(values) {
+    if (values === undefined) return;
+
+    for (const key in values) {
+      const newValue = values[key];
+      if (newValue === undefined) {
+        console.warn(`THREE.Material: parameter '${key}' has value of undefined.`);
+        continue;
+      }
+      const currentValue = this[key];
+      if (currentValue === undefined) {
+        console.warn(`THREE.Material: '${key}' is not a property of THREE.${this.type}.`);
+        continue;
+      }
+      if (currentValue && currentValue.isColor) {
+        currentValue.set(newValue);
+      } else if (currentValue && currentValue.isVector3 && newValue && newValue.isVector3) {
+        currentValue.copy(newValue);
+      } else {
+        this[key] = newValue;
+      }
+    }
+  }
+
+  dispose() {
+    this.dispatchEvent({ type: 'dispose' });
+  }
+
+  //TODO
+  //set needsUpdate(value) {
+  //  if (value === true) this.version++;
+  //}
+  //old:
+  get needsUpdate() {
+    return this._needsUpdate;
+  }
+  set needsUpdate(value) {
+    if ( value === true ) this.update();
+    this._needsUpdate = value;
+  }
+  update() {
+    this.dispatchEvent( { type: 'update' } );
+  }
+}
+
+// materials/ShaderMaterial.js
+class ShaderMaterial extends Material {
+  constructor(parameters) {
+    super();
+    this.isShaderMaterial = true;
+    this.type = 'ShaderMaterial';
+    this.uniforms = {};
+    this.vertexShader = '';
+    this.fragmentShader = '';
+    this.linewidth = 1;
+    this.fog = false; // set to use scene fog
+
+    this.extensions = {
+      fragDepth: false, // set to use fragment depth values
+    };
+
+    this.setValues(parameters);
+  }
+}
+
+
+// core/Object3D.js
+let _object3DId = 0;
+
+const _addedEvent = { type: 'added' };
+const _removedEvent = { type: 'removed' };
+
+class Object3D extends EventDispatcher {
+  constructor() {
+    super();
+
+    this.isObject3D = true;
+
+    Object.defineProperty(this, 'id', { value: _object3DId++ });
+
+    this.uuid = generateUUID();
+
+    this.name = '';
+    this.type = 'Object3D';
+
+    this.parent = null;
+    this.children = [];
+
+    this.up = Object3D.DEFAULT_UP.clone();
+
+    const position = new Vector3();
+    //const rotation = new Euler();
+    const quaternion = new Quaternion();
+    const scale = new Vector3(1, 1, 1);
+
+    //function onRotationChange() {
+    //  quaternion.setFromEuler(rotation, false);
+    //}
+    //function onQuaternionChange() {
+    //  rotation.setFromQuaternion(quaternion, undefined, false);
+    //}
+    //rotation._onChange(onRotationChange);
+    //quaternion._onChange(onQuaternionChange);
+
+    Object.defineProperties(this, {
+      position: {
+        configurable: true,
+        enumerable: true,
+        value: position,
+      },
+      //rotation: {
+      //  configurable: true,
+      //  enumerable: true,
+      //  value: rotation,
+      //},
+      quaternion: {
+        configurable: true,
+        enumerable: true,
+        value: quaternion,
+      },
+      scale: {
+        configurable: true,
+        enumerable: true,
+        value: scale,
+      },
+      modelViewMatrix: {
+        value: new Matrix4(),
+      },
+      //normalMatrix: {
+      //  value: new Matrix3(),
+      //},
+    });
+
+    this.matrix = new Matrix4();
+    this.matrixWorld = new Matrix4();
+
+    this.matrixAutoUpdate = Object3D.DEFAULT_MATRIX_AUTO_UPDATE;
+
+    this.matrixWorldAutoUpdate = Object3D.DEFAULT_MATRIX_WORLD_AUTO_UPDATE; // checked by the renderer
+    this.matrixWorldNeedsUpdate = false;
+
+    //this.layers = new Layers();
+    this.visible = true;
+
+    //this.castShadow = false;
+    //this.receiveShadow = false;
+
+    this.frustumCulled = true;
+    this.renderOrder = 0;
+
+    //this.animations = [];
+
+    this.userData = {};
+  }
+
+  add(object) {
+    if (arguments.length > 1) {
+      for (let i = 0; i < arguments.length; i++) {
+        this.add(arguments[i]);
+      }
+      return this;
+    }
+    if (object && object.isObject3D) {
+      if (object.parent !== null) {
+        object.parent.remove(object);
+      }
+      object.parent = this;
+      this.children.push(object);
+      object.dispatchEvent(_addedEvent);
+    }
+    return this;
+  }
+
+  remove(object) {
+    if (arguments.length > 1) {
+      for (let i = 0; i < arguments.length; i++) {
+        this.remove(arguments[i]);
+      }
+      return this;
+    }
+
+    const index = this.children.indexOf(object);
+    if (index !== -1) {
+      object.parent = null;
+      this.children.splice(index, 1);
+      object.dispatchEvent(_removedEvent);
+    }
+    return this;
+  }
+
+  updateMatrix() {
+    this.matrix.compose(this.position, this.quaternion, this.scale);
+    this.matrixWorldNeedsUpdate = true;
+  }
+
+  updateMatrixWorld(force) {
+    if (this.matrixAutoUpdate) this.updateMatrix();
+
+    if (this.matrixWorldNeedsUpdate || force) {
+      if (this.parent === null) {
+        this.matrixWorld.copy(this.matrix);
+      } else {
+        this.matrixWorld.multiplyMatrices(this.parent.matrixWorld, this.matrix);
+      }
+      this.matrixWorldNeedsUpdate = false;
+      force = true;
+    }
+
+    // update children
+    const children = this.children;
+    for (let i = 0, l = children.length; i < l; i++) {
+      const child = children[i];
+      //if (child.matrixWorldAutoUpdate === true || force === true) {
+      child.updateMatrixWorld(force);
+      //}
+    }
+  }
+}
+
+Object3D.DEFAULT_UP = /*@__PURE__*/ new Vector3(0, 1, 0);
+Object3D.DEFAULT_MATRIX_AUTO_UPDATE = true;
+Object3D.DEFAULT_MATRIX_WORLD_AUTO_UPDATE = true;
+
+
+
+// core/BufferAttribute.js
+class BufferAttribute {
+  constructor(array, itemSize, normalized = false) {
+    if (Array.isArray(array)) {
+      throw new TypeError('BufferAttribute: array should be a Typed Array.');
+    }
+    this.isBufferAttribute = true;
+
+    this.array = array;
+    this.itemSize = itemSize;
+    this.count = array !== undefined ? array.length / itemSize : 0;
+    this.normalized = normalized;
+
+    // FIXME: new variables
+    //this.usage = StaticDrawUsage;
+    //this._updateRange = { offset: 0, count: -1 };
+    //this.updateRanges = [];
+    //this.gpuType = FloatType;
+    // FIXME: old variables
+    this.dynamic = false;
+    this.updateRange = { offset: 0, count: -1 };
+    this.uuid = generateUUID();
+
+    this.version = 0;
+  }
+
+  onUploadCallback() {}
+}
+
+
+// core/BufferGeometry.js
+let _id = 0;
+
+class BufferGeometry extends EventDispatcher {
+  constructor() {
+    super();
+    this.isBufferGeometry = true;
+    Object.defineProperty(this, 'id', { value: _id++ });
+    this.uuid = generateUUID();
+    this.name = '';
+    this.type = 'BufferGeometry';
+    this.index = null;
+    this.attributes = {};
+    this.groups = [];
+    this.boundingBox = null;
+    this.boundingSphere = null;
+    this.drawRange = { start: 0, count: Infinity };
+  }
+
+  getIndex() {
+    return this.index;
+  }
+
+  setIndex(index) {
+    this.index = index;
+  }
+
+  setAttribute(name, attribute) {
+    this.attributes[name] = attribute;
+    return this;
+  }
+
+  dispose() {
+    this.dispatchEvent({ type: 'dispose' });
+  }
+}
+
+
+// objects/Mesh.js
+class Mesh extends Object3D {
+  constructor(geometry, material) {
+    super();
+
+    this.isMesh = true;
+
+    this.type = 'Mesh';
+
+    if (!geometry) throw new TypeError('Mesh: geometry not set');
+    this.geometry = geometry;
+    this.material = material;
+  }
+}
+
+
+// cameras/Camera.js
+class Camera extends Object3D {
+  constructor() {
+    super();
+    this.isCamera = true;
+    this.type = 'Camera';
+    this.matrixWorldInverse = new Matrix4();
+    this.projectionMatrix = new Matrix4();
+    this.projectionMatrixInverse = new Matrix4();
+    //this.coordinateSystem = WebGLCoordinateSystem;
+  }
+
+  // FIXME
+  //updateMatrixWorld(force) {
+  //  super.updateMatrixWorld(force);
+  //  this.matrixWorldInverse.copy(this.matrixWorld).invert();
+  //}
+
+  //updateWorldMatrix(updateParents, updateChildren) {
+  //  super.updateWorldMatrix(updateParents, updateChildren);
+  //  this.matrixWorldInverse.copy(this.matrixWorld).invert();
+  //}
+}
+
+// cameras/OrthographicCamera.js
+class OrthographicCamera extends Camera {
+  constructor(left = -1, right = 1, top = 1, bottom = -1, near = 0.1, far = 2000) {
+    super();
+    this.type = 'OrthographicCamera';
+    this.zoom = 1;
+    //this.view = null;
+    this.left = left;
+    this.right = right;
+    this.top = top;
+    this.bottom = bottom;
+    this.near = near;
+    this.far = far;
+    this.updateProjectionMatrix();
+  }
+
+  updateProjectionMatrix() {
+    const dx = (this.right - this.left) / (2 * this.zoom);
+    const dy = (this.top - this.bottom) / (2 * this.zoom);
+    const cx = (this.right + this.left) / 2;
+    const cy = (this.top + this.bottom) / 2;
+
+    let left = cx - dx;
+    let right = cx + dx;
+    let top = cy + dy;
+    let bottom = cy - dy;
+
+    this.projectionMatrix.makeOrthographic(left, right, top, bottom, this.near, this.far);
+    this.projectionMatrixInverse.copy(this.projectionMatrix).invert();
+  }
+}
+
+
+// renderers/webgl/WebGLIndexedBufferRenderer.js (not updated)
+function WebGLIndexedBufferRenderer( gl, extensions, infoRender ) {
+  let mode;
+
+  function setMode( value ) {
+    mode = value;
+  }
+
+  let type, size;
+
+  function setIndex( index ) {
+    if ( index.array instanceof Uint32Array && extensions.get( 'OES_element_index_uint' ) ) {
+      type = gl.UNSIGNED_INT;
+      size = 4;
+    } else if ( index.array instanceof Uint16Array ) {
+      type = gl.UNSIGNED_SHORT;
+      size = 2;
+    } else {
+      type = gl.UNSIGNED_BYTE;
+      size = 1;
+    }
+  }
+
+  function render( start, count ) {
+    gl.drawElements( mode, count, type, start * size );
+
+    infoRender.calls ++;
+    infoRender.vertices += count;
+
+    if ( mode === gl.TRIANGLES ) infoRender.faces += count / 3;
+  }
+
+  return {
+    setMode: setMode,
+    setIndex: setIndex,
+    render: render,
+  };
+}
+
+
+// renderers/webgl/WebGLBufferRenderer.js (not updated)
+function WebGLBufferRenderer( gl, extensions, infoRender ) {
+  let mode;
+
+  function setMode( value ) {
+    mode = value;
+  }
+
+  function render( start, count ) {
+    gl.drawArrays( mode, start, count );
+
+    infoRender.calls ++;
+    infoRender.vertices += count;
+
+    if ( mode === gl.TRIANGLES ) infoRender.faces += count / 3;
+  }
+
+  return {
+    setMode: setMode,
+    render: render,
+  };
+}
+
+
+// renderers/webgl/WebGLShader.js (not updated)
+function WebGLShader( gl, type, string ) {
+  let shader = gl.createShader( type );
+
+  gl.shaderSource( shader, string );
+  gl.compileShader( shader );
+
+  if ( gl.getShaderParameter( shader, gl.COMPILE_STATUS ) === false ) {
+    console.error( 'WebGLShader: Shader couldn\'t compile.' );
+  }
+
+  if ( gl.getShaderInfoLog( shader ) !== '' ) {
+    let info = gl.getShaderInfoLog( shader );
+    // workaround for https://github.com/mrdoob/three.js/issues/9716
+    if (info.indexOf('GL_ARB_gpu_shader5') === -1) {
+      console.warn( 'WebGLShader: gl.getShaderInfoLog()', type === gl.VERTEX_SHADER ? 'vertex' : 'fragment', info, string );
+    }
+  }
+
+  return shader;
+}
+
+
+// renderers/webgl/WebGLProgram.js (not updated)
+let programIdCount = 0;
+
+function generateExtensions( extensions, parameters, rendererExtensions ) {
+  extensions = extensions || {};
+
+  let chunks = [
+  ( extensions.fragDepth ) && rendererExtensions.get( 'EXT_frag_depth' ) ? '#extension GL_EXT_frag_depth : enable' : '',
+  ];
+
+  return chunks.join( '\n' );
+}
+
+function fetchAttributeLocations( gl, program ) {
+  let attributes = {};
+
+  let n = gl.getProgramParameter( program, gl.ACTIVE_ATTRIBUTES );
+
+  for ( let i = 0; i < n; i ++ ) {
+    let info = gl.getActiveAttrib( program, i );
+    let name = info.name;
+
+    // console.log("WebGLProgram: ACTIVE VERTEX ATTRIBUTE:", name, i );
+
+    attributes[name] = gl.getAttribLocation( program, name );
+  }
+
+  return attributes;
+}
+
+function WebGLProgram( renderer, code, material, parameters ) {
+  let gl = renderer.context;
+
+  let extensions = material.extensions;
+
+  let vertexShader = material.__webglShader.vertexShader;
+  let fragmentShader = material.__webglShader.fragmentShader;
+
+  // console.log( 'building new program ' );
+
+  //
+
+  let customExtensions = generateExtensions( extensions, parameters, renderer.extensions );
+
+  //
+
+  let program = gl.createProgram();
+
+  let prefixVertex, prefixFragment;
+
+  prefixVertex = [
+    'precision ' + parameters.precision + ' float;',
+    'precision ' + parameters.precision + ' int;',
+    '#define SHADER_NAME ' + material.__webglShader.name,
+    'uniform mat4 modelMatrix;',
+    'uniform mat4 modelViewMatrix;',
+    'uniform mat4 projectionMatrix;',
+    'uniform mat4 viewMatrix;',
+    'attribute vec3 position;',
+    '',
+  ].join( '\n' );
+
+  prefixFragment = [
+    customExtensions,
+    'precision ' + parameters.precision + ' float;',
+    'precision ' + parameters.precision + ' int;',
+    '#define SHADER_NAME ' + material.__webglShader.name,
+    ( parameters.useFog && parameters.fog ) ? '#define USE_FOG' : '',
+    '',
+  ].join( '\n' );
+
+  let vertexGlsl = prefixVertex + vertexShader;
+  let fragmentGlsl = prefixFragment + fragmentShader;
+
+  // console.log( '*VERTEX*', vertexGlsl );
+  // console.log( '*FRAGMENT*', fragmentGlsl );
+
+  let glVertexShader = WebGLShader( gl, gl.VERTEX_SHADER, vertexGlsl );
+  let glFragmentShader = WebGLShader( gl, gl.FRAGMENT_SHADER, fragmentGlsl );
+
+  gl.attachShader( program, glVertexShader );
+  gl.attachShader( program, glFragmentShader );
+
+  gl.linkProgram( program );
+
+  let programLog = gl.getProgramInfoLog( program );
+  let vertexLog = gl.getShaderInfoLog( glVertexShader );
+  let fragmentLog = gl.getShaderInfoLog( glFragmentShader );
+
+  // console.log( '**VERTEX**', gl.getExtension( 'WEBGL_debug_shaders' ).getTranslatedShaderSource( glVertexShader ) );
+  // console.log( '**FRAGMENT**', gl.getExtension( 'WEBGL_debug_shaders' ).getTranslatedShaderSource( glFragmentShader ) );
+
+  if ( gl.getProgramParameter( program, gl.LINK_STATUS ) === false ) {
+    console.error( 'WebGLProgram: shader error: ', gl.getError(), 'gl.VALIDATE_STATUS', gl.getProgramParameter( program, gl.VALIDATE_STATUS ), 'gl.getProgramInfoLog', programLog, vertexLog, fragmentLog );
+  } else if ( programLog !== '' ) {
+    console.warn( 'WebGLProgram: gl.getProgramInfoLog()', programLog );
+  }
+
+  // clean up
+
+  gl.deleteShader( glVertexShader );
+  gl.deleteShader( glFragmentShader );
+
+  // set up caching for uniform locations
+
+  let cachedUniforms;
+
+  this.getUniforms = function () {
+    if ( cachedUniforms === undefined ) {
+      cachedUniforms = new WebGLUniforms( gl, program );
+    }
+
+    return cachedUniforms;
+  };
+
+  // set up caching for attribute locations
+
+  let cachedAttributes;
+
+  this.getAttributes = function () {
+    if ( cachedAttributes === undefined ) {
+      cachedAttributes = fetchAttributeLocations( gl, program );
+    }
+
+    return cachedAttributes;
+  };
+
+  // free resource
+
+  this.destroy = function () {
+    gl.deleteProgram( program );
+    this.program = undefined;
+  };
+
+  //
+
+  this.id = programIdCount ++;
+  this.code = code;
+  this.usedTimes = 1;
+  this.program = program;
+  this.vertexShader = glVertexShader;
+  this.fragmentShader = glFragmentShader;
+
+  return this;
+}
+
+
+function WebGLPrograms( renderer, capabilities ) {
+  let programs = [];
+
+  let parameterNames = [
+    'precision',
+    'fog', 'useFog',
+    'premultipliedAlpha',
+  ];
+
+  this.getParameters = function ( material, fog ) {
+    let precision = renderer.getPrecision();
+
+    if ( material.precision !== null ) {
+      precision = capabilities.getMaxPrecision( material.precision );
+
+      if ( precision !== material.precision ) {
+        console.warn( 'WebGLProgram.getParameters:', material.precision, 'not supported, using', precision, 'instead.' );
+      }
+    }
+
+    let parameters = {
+      precision: precision,
+      fog: !! fog,
+      useFog: material.fog,
+      premultipliedAlpha: material.premultipliedAlpha,
+    };
+
+    return parameters;
+  };
+
+  this.getProgramCode = function ( material, parameters ) {
+    let array = [];
+
+    array.push( material.fragmentShader );
+    array.push( material.vertexShader );
+
+    for ( let i = 0; i < parameterNames.length; i ++ ) {
+      array.push( parameters[parameterNames[i]] );
+    }
+
+    return array.join();
+  };
+
+  this.acquireProgram = function ( material, parameters, code ) {
+    let program;
+
+    // Check if code has been already compiled
+    for ( let p = 0, pl = programs.length; p < pl; p ++ ) {
+      let programInfo = programs[p];
+
+      if ( programInfo.code === code ) {
+        program = programInfo;
+        ++ program.usedTimes;
+
+        break;
+      }
+    }
+
+    if ( program === undefined ) {
+      program = new WebGLProgram( renderer, code, material, parameters );
+      programs.push( program );
+    }
+
+    return program;
+  };
+
+  this.releaseProgram = function ( program ) {
+    if ( -- program.usedTimes === 0 ) {
+      // Remove from unordered set
+      let i = programs.indexOf( program );
+      programs[i] = programs[programs.length - 1];
+      programs.pop();
+
+      // Free WebGL resources
+      program.destroy();
+    }
+  };
+
+  // Exposed for resource monitoring & error feedback via renderer.info:
+  this.programs = programs;
+}
+
+
+// renderers/webgl/WebGLGeometries.js (not updated)
+function WebGLGeometries( gl, properties ) {
+  let geometries = {};
+
+  function onGeometryDispose( event ) {
+    let geometry = event.target;
+    let buffergeometry = geometries[geometry.id];
+
+    if ( buffergeometry.index !== null ) {
+      deleteAttribute( buffergeometry.index );
+    }
+
+    deleteAttributes( buffergeometry.attributes );
+
+    geometry.removeEventListener( 'dispose', onGeometryDispose );
+
+    delete geometries[geometry.id];
+
+    properties.delete( geometry );
+
+    properties.delete( buffergeometry );
+  }
+
+  function getAttributeBuffer( attribute ) {
+    return properties.get( attribute ).__webglBuffer;
+  }
+
+  function deleteAttribute( attribute ) {
+    let buffer = getAttributeBuffer( attribute );
+
+    if ( buffer !== undefined ) {
+      gl.deleteBuffer( buffer );
+      removeAttributeBuffer( attribute );
+    }
+  }
+
+  function deleteAttributes( attributes ) {
+    for ( let name in attributes ) {
+      deleteAttribute( attributes[name] );
+    }
+  }
+
+  function removeAttributeBuffer( attribute ) {
+    properties.delete( attribute );
+  }
+
+  return {
+
+    get: function ( object ) {
+      let geometry = object.geometry;
+
+      if ( geometries[geometry.id] !== undefined ) {
+        return geometries[geometry.id];
+      }
+
+      geometry.addEventListener( 'dispose', onGeometryDispose );
+
+      let buffergeometry;
+
+      if ( geometry.isBufferGeometry ) {
+        buffergeometry = geometry;
+      }
+
+      geometries[geometry.id] = buffergeometry;
+
+      return buffergeometry;
+    },
+
+  };
+}
+
+
+// renderers/webgl/WebGLObjects.js (not updated)
+function WebGLObjects( gl, properties, info ) {
+  let geometries = new WebGLGeometries( gl, properties);
+
+  //
+
+  function update( object ) {
+    let geometry = geometries.get( object );
+
+    let index = geometry.index;
+    let attributes = geometry.attributes;
+
+    if ( index !== null ) {
+      updateAttribute( index, gl.ELEMENT_ARRAY_BUFFER );
+    }
+
+    for ( let name in attributes ) {
+      updateAttribute( attributes[name], gl.ARRAY_BUFFER );
+    }
+
+    return geometry;
+  }
+
+  function updateAttribute( attribute, bufferType ) {
+    let data = attribute;
+
+    let attributeProperties = properties.get( data );
+
+    if ( attributeProperties.__webglBuffer === undefined ) {
+      createBuffer( attributeProperties, data, bufferType );
+    } else if ( attributeProperties.version !== data.version ) {
+      updateBuffer( attributeProperties, data, bufferType );
+    }
+  }
+
+  function createBuffer( attributeProperties, data, bufferType ) {
+    attributeProperties.__webglBuffer = gl.createBuffer();
+    gl.bindBuffer( bufferType, attributeProperties.__webglBuffer );
+
+    let usage = data.dynamic ? gl.DYNAMIC_DRAW : gl.STATIC_DRAW;
+
+    gl.bufferData( bufferType, data.array, usage );
+
+    let type = gl.FLOAT;
+    let array = data.array;
+
+    if ( array instanceof Float32Array ) {
+      type = gl.FLOAT;
+    } else if ( array instanceof Float64Array ) {
+      console.warn( 'Unsupported data buffer format: Float64Array' );
+    } else if ( array instanceof Uint16Array ) {
+      type = gl.UNSIGNED_SHORT;
+    } else if ( array instanceof Int16Array ) {
+      type = gl.SHORT;
+    } else if ( array instanceof Uint32Array ) {
+      type = gl.UNSIGNED_INT;
+    } else if ( array instanceof Int32Array ) {
+      type = gl.INT;
+    } else if ( array instanceof Int8Array ) {
+      type = gl.BYTE;
+    } else if ( array instanceof Uint8Array ) {
+      type = gl.UNSIGNED_BYTE;
+    }
+
+    attributeProperties.bytesPerElement = array.BYTES_PER_ELEMENT;
+    attributeProperties.type = type;
+    attributeProperties.version = data.version;
+
+    data.onUploadCallback();
+  }
+
+  function updateBuffer( attributeProperties, data, bufferType ) {
+    gl.bindBuffer( bufferType, attributeProperties.__webglBuffer );
+
+    if ( data.dynamic === false ) {
+      gl.bufferData( bufferType, data.array, gl.STATIC_DRAW );
+    } else if ( data.updateRange.count === -1 ) {
+      // Not using update ranges
+
+      gl.bufferSubData( bufferType, 0, data.array );
+    } else if ( data.updateRange.count === 0 ) {
+      console.error( 'WebGLObjects.updateBuffer: updateRange.count is 0.' );
+    } else {
+      gl.bufferSubData( bufferType, data.updateRange.offset * data.array.BYTES_PER_ELEMENT,
+                        data.array.subarray( data.updateRange.offset, data.updateRange.offset + data.updateRange.count ) );
+
+      data.updateRange.count = 0; // reset range
+    }
+
+    attributeProperties.version = data.version;
+  }
+
+  function getAttributeBuffer( attribute ) {
+    return properties.get( attribute ).__webglBuffer;
+  }
+
+  function getAttributeProperties( attribute ) {
+    return properties.get( attribute );
+  }
+
+
+  return {
+
+    getAttributeBuffer: getAttributeBuffer,
+    getAttributeProperties: getAttributeProperties,
+
+    update: update,
+
+  };
+}
+
+
+// renderers/webgl/WebGLTextures.js (not updated)
+function WebGLTextures( _gl, extensions, state, properties, capabilities ) {
+  function onTextureDispose( event ) {
+    let texture = event.target;
+
+    texture.removeEventListener( 'dispose', onTextureDispose );
+
+    deallocateTexture( texture );
+  }
+
+  //
+
+  function deallocateTexture( texture ) {
+    let textureProperties = properties.get( texture );
+
+    // 2D texture
+
+    if ( textureProperties.__webglInit === undefined ) return;
+
+    _gl.deleteTexture( textureProperties.__webglTexture );
+
+    // remove all webgl properties
+    properties.delete( texture );
+  }
+
+  let textureUnits = 0;
+
+  function resetTextureUnits() {
+    textureUnits = 0;
+  }
+
+  function allocateTextureUnit() {
+    const textureUnit = textureUnits;
+    if (textureUnit >= capabilities.maxTextures) {
+      console.warn('WebGLTextures: Trying to use ' + textureUnit +
+                   ' texture units while this GPU supports only ' + capabilities.maxTextures);
+    }
+    textureUnits += 1;
+    return textureUnit;
+  }
+
+  function setTexture2D( texture, slot ) {
+    let textureProperties = properties.get( texture );
+
+    if ( texture.version > 0 && textureProperties.__version !== texture.version ) {
+      let image = texture.image;
+
+      if ( image === undefined ) {
+        console.warn( 'WebGLRenderer: Texture marked for update but image is undefined', texture );
+      } else if ( image.complete === false ) {
+        console.warn( 'WebGLRenderer: Texture marked for update but image is incomplete', texture );
+      } else {
+        uploadTexture( textureProperties, texture, slot );
+        return;
+      }
+    }
+
+    state.activeTexture( _gl.TEXTURE0 + slot );
+    state.bindTexture( _gl.TEXTURE_2D, textureProperties.__webglTexture );
+  }
+
+  function setTextureParameters( textureType ) {
+    _gl.texParameteri( textureType, _gl.TEXTURE_WRAP_S, _gl.CLAMP_TO_EDGE );
+    _gl.texParameteri( textureType, _gl.TEXTURE_WRAP_T, _gl.CLAMP_TO_EDGE );
+    _gl.texParameteri( textureType, _gl.TEXTURE_MAG_FILTER, _gl.LINEAR );
+    _gl.texParameteri( textureType, _gl.TEXTURE_MIN_FILTER, _gl.LINEAR_MIPMAP_LINEAR );
+  }
+
+  function uploadTexture( textureProperties, texture, slot ) {
+    if ( textureProperties.__webglInit === undefined ) {
+      textureProperties.__webglInit = true;
+
+      texture.addEventListener( 'dispose', onTextureDispose );
+
+      textureProperties.__webglTexture = _gl.createTexture();
+    }
+
+    state.activeTexture( _gl.TEXTURE0 + slot );
+    state.bindTexture( _gl.TEXTURE_2D, textureProperties.__webglTexture );
+
+    _gl.pixelStorei( _gl.UNPACK_FLIP_Y_WEBGL, true );
+    _gl.pixelStorei( _gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false );
+    _gl.pixelStorei( _gl.UNPACK_ALIGNMENT, 4 );
+
+    let image = texture.image;
+
+    let glFormat = _gl.RGBA;
+    let glType = _gl.UNSIGNED_BYTE;
+
+    setTextureParameters( _gl.TEXTURE_2D );
+
+    state.texImage2D( _gl.TEXTURE_2D, 0, glFormat, glFormat, glType, image );
+
+    _gl.generateMipmap( _gl.TEXTURE_2D );
+
+    textureProperties.__version = texture.version;
+  }
+
+  this.setTexture2D = setTexture2D;
+  this.resetTextureUnits = resetTextureUnits;
+  this.allocateTextureUnit = allocateTextureUnit;
+}
+
+
+// renderers/webgl/WebGLProperties.js (not updated)
+function WebGLProperties() {
+  let properties = {};
+
+  return {
+
+    get: function ( object ) {
+      let uuid = object.uuid;
+      let map = properties[uuid];
+
+      if ( map === undefined ) {
+        map = {};
+        properties[uuid] = map;
+      }
+
+      return map;
+    },
+
+    delete: function ( object ) {
+      delete properties[object.uuid];
+    },
+
+    clear: function () {
+      properties = {};
+    }
+  };
+}
+
+
+// renderers/webgl/WebGLState.js (not updated)
+function WebGLState( gl ) {
+  function ColorBuffer() {
+    let color = new Vector4();
+    let currentColorClear = new Vector4();
+
+    return {
+
+      setClear: function ( r, g, b, a, premultipliedAlpha ) {
+        if ( premultipliedAlpha === true ) {
+          r *= a; g *= a; b *= a;
+        }
+        color.set( r, g, b, a );
+        if ( currentColorClear.equals( color ) === false ) {
+          gl.clearColor( r, g, b, a );
+          currentColorClear.copy( color );
+        }
+      },
+
+      reset: function () {
+        currentColorClear.set( 0, 0, 0, 1 );
+      }
+    };
+  }
+
+  function DepthBuffer() {
+    let currentDepthMask = null;
+    let currentDepthClear = null;
+
+    return {
+
+      setTest: function ( depthTest ) {
+        if ( depthTest ) {
+          enable( gl.DEPTH_TEST );
+        } else {
+          disable( gl.DEPTH_TEST );
+        }
+      },
+
+      setMask: function ( depthMask ) {
+        if ( currentDepthMask !== depthMask ) {
+          gl.depthMask( depthMask );
+          currentDepthMask = depthMask;
+        }
+      },
+
+      setClear: function ( depth ) {
+        if ( currentDepthClear !== depth ) {
+          gl.clearDepth( depth );
+          currentDepthClear = depth;
+        }
+      },
+
+      reset: function () {
+        currentDepthMask = null;
+        currentDepthClear = null;
+      },
+
+    };
+  }
+
+
+  //
+
+  let colorBuffer = new ColorBuffer();
+  let depthBuffer = new DepthBuffer();
+
+  let maxVertexAttributes = gl.getParameter( gl.MAX_VERTEX_ATTRIBS );
+  let newAttributes = new Uint8Array( maxVertexAttributes );
+  let enabledAttributes = new Uint8Array( maxVertexAttributes );
+
+  let capabilities = {};
+
+  let currentBlending = null;
+  let currentPremultipledAlpha = false;
+
+  let currentLineWidth = null;
+
+  const glVersion = gl.getParameter(gl.VERSION);
+  let lineWidthAvailable = false;
+  if ( glVersion.indexOf( 'WebGL' ) !== -1 ) {
+    let version = parseFloat( /^WebGL\ (\d)/.exec( glVersion )[1] );
+    lineWidthAvailable = ( version >= 1.0 );
+  }
+
+  let currentTextureSlot = null;
+  let currentBoundTextures = {};
+
+  let currentViewport = new Vector4();
+
+  function createTexture( type, target, count ) {
+    let data = new Uint8Array( 4 ); // 4 is required to match default unpack alignment of 4.
+    let texture = gl.createTexture();
+
+    gl.bindTexture( type, texture );
+    gl.texParameteri( type, gl.TEXTURE_MIN_FILTER, gl.NEAREST );
+    gl.texParameteri( type, gl.TEXTURE_MAG_FILTER, gl.NEAREST );
+
+    for ( let i = 0; i < count; i ++ ) {
+      gl.texImage2D( target + i, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, data );
+    }
+
+    return texture;
+  }
+
+  let emptyTextures = {};
+  emptyTextures[gl.TEXTURE_2D] = createTexture( gl.TEXTURE_2D, gl.TEXTURE_2D, 1 );
+
+  //
+
+  function init() {
+    colorBuffer.setClear( 0, 0, 0, 1 );
+    depthBuffer.setClear( 1 );
+
+    enable( gl.DEPTH_TEST );
+    gl.depthFunc( gl.LEQUAL );
+
+    enable( gl.BLEND );
+    setBlending( NormalBlending );
+  }
+
+  function initAttributes() {
+    for ( let i = 0, l = newAttributes.length; i < l; i ++ ) {
+      newAttributes[i] = 0;
+    }
+  }
+
+  function enableAttribute( attribute ) {
+    newAttributes[attribute] = 1;
+
+    if ( enabledAttributes[attribute] === 0 ) {
+      gl.enableVertexAttribArray( attribute );
+      enabledAttributes[attribute] = 1;
+    }
+  }
+
+  function disableUnusedAttributes() {
+    for ( let i = 0, l = enabledAttributes.length; i !== l; ++ i ) {
+      if ( enabledAttributes[i] !== newAttributes[i] ) {
+        gl.disableVertexAttribArray( i );
+        enabledAttributes[i] = 0;
+      }
+    }
+  }
+
+  function enable( id ) {
+    if ( capabilities[id] !== true ) {
+      gl.enable( id );
+      capabilities[id] = true;
+    }
+  }
+
+  function disable( id ) {
+    if ( capabilities[id] !== false ) {
+      gl.disable( id );
+      capabilities[id] = false;
+    }
+  }
+
+  function setBlending( blending, premultipliedAlpha ) {
+    if ( blending !== NoBlending ) {
+      enable( gl.BLEND );
+    } else {
+      disable( gl.BLEND );
+    }
+
+    if ( blending !== currentBlending || premultipliedAlpha !== currentPremultipledAlpha ) {
+      if ( premultipliedAlpha ) {
+        gl.blendEquationSeparate( gl.FUNC_ADD, gl.FUNC_ADD );
+        gl.blendFuncSeparate( gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA );
+      } else {
+        gl.blendEquationSeparate( gl.FUNC_ADD, gl.FUNC_ADD );
+        gl.blendFuncSeparate( gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA );
+      }
+
+      currentBlending = blending;
+      currentPremultipledAlpha = premultipliedAlpha;
+    }
+  }
+
+  function setDepthTest( depthTest ) {
+    depthBuffer.setTest( depthTest );
+  }
+
+  function setDepthWrite( depthWrite ) {
+    depthBuffer.setMask( depthWrite );
+  }
+
+  //
+
+  function setLineWidth( width ) {
+    if ( width !== currentLineWidth ) {
+      if ( lineWidthAvailable ) gl.lineWidth( width );
+
+      currentLineWidth = width;
+    }
+  }
+
+  // texture
+
+  function activeTexture( webglSlot ) {
+    if ( currentTextureSlot !== webglSlot ) {
+      gl.activeTexture( webglSlot );
+      currentTextureSlot = webglSlot;
+    }
+  }
+
+  function bindTexture( webglType, webglTexture ) {
+    let boundTexture = currentBoundTextures[currentTextureSlot];
+    if ( boundTexture === undefined ) {
+      boundTexture = { type: undefined, texture: undefined };
+      currentBoundTextures[currentTextureSlot] = boundTexture;
+    }
+
+    if ( boundTexture.type !== webglType || boundTexture.texture !== webglTexture ) {
+      gl.bindTexture( webglType, webglTexture || emptyTextures[webglType] );
+
+      boundTexture.type = webglType;
+      boundTexture.texture = webglTexture;
+    }
+  }
+
+  function texImage2D() {
+    try {
+      gl.texImage2D.apply( gl, arguments );
+    } catch ( error ) {
+      console.error( error );
+    }
+  }
+
+  //
+
+  function viewport( viewport ) {
+    if ( currentViewport.equals( viewport ) === false ) {
+      gl.viewport( viewport.x, viewport.y, viewport.z, viewport.w );
+      currentViewport.copy( viewport );
+    }
+  }
+
+  function reset() {
+    for ( let i = 0; i < enabledAttributes.length; i ++ ) {
+      if ( enabledAttributes[ i ] === 1 ) {
+        gl.disableVertexAttribArray( i );
+        enabledAttributes[ i ] = 0;
+      }
+    }
+    capabilities = {};
+    currentTextureSlot = null;
+    currentBoundTextures = {};
+    currentBlending = null;
+    colorBuffer.reset();
+    depthBuffer.reset();
+  }
+
+  //
+
+  return {
+    buffers: {
+      color: colorBuffer,
+      depth: depthBuffer,
+    },
+
+    init: init,
+    initAttributes: initAttributes,
+    enableAttribute: enableAttribute,
+    disableUnusedAttributes: disableUnusedAttributes,
+    enable: enable,
+    disable: disable,
+
+    setBlending: setBlending,
+
+    setDepthTest: setDepthTest,
+    setDepthWrite: setDepthWrite,
+
+    setLineWidth: setLineWidth,
+
+    activeTexture: activeTexture,
+    bindTexture: bindTexture,
+    texImage2D: texImage2D,
+
+    viewport: viewport,
+    reset: reset
+  };
+}
+
+
+// renderers/webgl/WebGLCapabilities.js (not updated)
+function WebGLCapabilities( gl, extensions, parameters ) {
+  function getMaxPrecision( precision ) {
+    if ( precision === 'highp' ) {
+      if ( gl.getShaderPrecisionFormat( gl.VERTEX_SHADER, gl.HIGH_FLOAT ).precision > 0 &&
+         gl.getShaderPrecisionFormat( gl.FRAGMENT_SHADER, gl.HIGH_FLOAT ).precision > 0 ) {
+        return 'highp';
+      }
+
+      precision = 'mediump';
+    }
+
+    if ( precision === 'mediump' ) {
+      if ( gl.getShaderPrecisionFormat( gl.VERTEX_SHADER, gl.MEDIUM_FLOAT ).precision > 0 &&
+         gl.getShaderPrecisionFormat( gl.FRAGMENT_SHADER, gl.MEDIUM_FLOAT ).precision > 0 ) {
+        return 'mediump';
+      }
+    }
+
+    return 'lowp';
+  }
+
+  let precision = parameters.precision !== undefined ? parameters.precision : 'highp';
+  let maxPrecision = getMaxPrecision( precision );
+
+  if ( maxPrecision !== precision ) {
+    console.warn( 'WebGLRenderer:', precision, 'not supported, using', maxPrecision, 'instead.' );
+    precision = maxPrecision;
+  }
+
+  let maxTextures = gl.getParameter( gl.MAX_TEXTURE_IMAGE_UNITS );
+
+  return {
+    getMaxPrecision: getMaxPrecision,
+    precision: precision,
+    maxTextures: maxTextures,
+  };
+}
+
+
+// renderers/webgl/WebGLExtensions.js (not updated)
+function WebGLExtensions( gl ) {
+  let extensions = {};
+
+  return {
+
+    get: function ( name ) {
+      if ( extensions[name] !== undefined ) {
+        return extensions[name];
+      }
+
+      let extension;
+
+      switch ( name ) {
+        case 'WEBGL_depth_texture':
+          extension = gl.getExtension( 'WEBGL_depth_texture' ) || gl.getExtension( 'MOZ_WEBGL_depth_texture' ) || gl.getExtension( 'WEBKIT_WEBGL_depth_texture' );
+          break;
+        default:
+          extension = gl.getExtension( name );
+      }
+
+      if ( extension === null ) {
+        console.warn( 'WebGLRenderer: ' + name + ' extension not supported.' );
+      }
+
+      extensions[name] = extension;
+
+      return extension;
+    },
+
+  };
+}
+
+
+// renderers/WebGLRenderer.js (not updated)
+function WebGLRenderer( parameters ) {
+  parameters = parameters || {};
+
+  let _canvas = parameters.canvas !== undefined ? parameters.canvas : document.createElementNS( 'http://www.w3.org/1999/xhtml', 'canvas' ),
+    _context = parameters.context !== undefined ? parameters.context : null,
+    _antialias = parameters.antialias !== undefined ? parameters.antialias : false,
+    _premultipliedAlpha = parameters.premultipliedAlpha !== undefined ? parameters.premultipliedAlpha : true;
+
+  let opaqueObjects = [];
+  let opaqueObjectsLastIndex = -1;
+  let transparentObjects = [];
+  let transparentObjectsLastIndex = -1;
+
+  // public properties
+
+  this.domElement = _canvas;
+  this.context = null;
+
+  // clearing
+
+  this.autoClear = true;
+  this.autoClearColor = true;
+  this.autoClearDepth = true;
+
+  // scene graph
+
+  this.sortObjects = true;
+
+  // internal properties
+
+  let _this = this,
+
+    // internal state cache
+
+    _currentProgram = null,
+    _currentRenderTarget = null,
+    _currentMaterialId = -1,
+    _currentGeometryProgram = '',
+    _currentCamera = null,
+
+    _currentViewport = new Vector4(),
+
+    //
+
+    _clearColor = new Color( 0x000000 ),
+    _clearAlpha = 0,
+
+    _width = _canvas.width,
+    _height = _canvas.height,
+
+    _pixelRatio = 1,
+
+    _viewport = new Vector4( 0, 0, _width, _height ),
+
+    // camera matrices cache
+
+    _projScreenMatrix = new Matrix4(),
+
+    _vector3 = new Vector3(),
+
+    // info
+
+    _infoRender = {
+      calls: 0,
+      vertices: 0,
+      faces: 0,
+      points: 0,
+    };
+
+  this.info = {
+    render: _infoRender,
+    programs: null,
+  };
+
+
+  // initialize
+
+  let _gl;
+
+  try {
+    let attributes = {
+      alpha: false,
+      depth: true,
+      antialias: _antialias,
+      premultipliedAlpha: _premultipliedAlpha,
+      preserveDrawingBuffer: false,
+    };
+
+    _gl = _context || _canvas.getContext( 'webgl', attributes ) || _canvas.getContext( 'experimental-webgl', attributes );
+
+    if ( _gl === null ) {
+      if ( _canvas.getContext( 'webgl' ) !== null ) {
+        throw new Error('Error creating WebGL context with your selected attributes.');
+      } else {
+        throw new Error('Error creating WebGL context.');
+      }
+    }
+
+    // Some experimental-webgl implementations do not have getShaderPrecisionFormat
+
+    if ( _gl.getShaderPrecisionFormat === undefined ) {
+      _gl.getShaderPrecisionFormat = function () {
+        return { 'rangeMin': 1, 'rangeMax': 1, 'precision': 1 };
+      };
+    }
+
+    _canvas.addEventListener( 'webglcontextlost', onContextLost, false );
+  } catch ( error ) {
+    console.error( 'WebGLRenderer: ' + error );
+  }
+
+  let extensions = new WebGLExtensions( _gl );
+  extensions.get( 'WEBGL_depth_texture' );
+  extensions.get( 'OES_element_index_uint' );
+
+  let capabilities = new WebGLCapabilities( _gl, extensions, parameters );
+
+  let state = new WebGLState( _gl );
+  let properties = new WebGLProperties();
+  let textures = new WebGLTextures( _gl, extensions, state, properties, capabilities );
+  let objects = new WebGLObjects( _gl, properties, this.info );
+  let programCache = new WebGLPrograms( this, capabilities );
+
+  this.info.programs = programCache.programs;
+
+  let bufferRenderer = new WebGLBufferRenderer( _gl, extensions, _infoRender );
+  let indexedBufferRenderer = new WebGLIndexedBufferRenderer( _gl, extensions, _infoRender );
+
+  //
+
+  function getTargetPixelRatio() {
+    return _currentRenderTarget === null ? _pixelRatio : 1;
+  }
+
+  function setDefaultGLState() {
+    state.init();
+
+    state.viewport( _currentViewport.copy( _viewport ).multiplyScalar( _pixelRatio ) );
+
+    state.buffers.color.setClear( _clearColor.r, _clearColor.g, _clearColor.b, _clearAlpha, _premultipliedAlpha );
+  }
+
+  function resetGLState() {
+    _currentProgram = null;
+    _currentCamera = null;
+
+    _currentGeometryProgram = '';
+    _currentMaterialId = -1;
+
+    state.reset();
+  }
+
+  setDefaultGLState();
+
+  this.context = _gl;
+  this.capabilities = capabilities;
+  this.extensions = extensions;
+  this.properties = properties;
+  this.state = state;
+
+  // API
+
+  this.getContext = function () {
+    return _gl;
+  };
+
+  this.getPrecision = function () {
+    return capabilities.precision;
+  };
+
+  this.getPixelRatio = function () {
+    return _pixelRatio;
+  };
+
+  this.setPixelRatio = function ( value ) {
+    if ( value === undefined ) return;
+
+    _pixelRatio = value;
+
+    this.setSize( _viewport.z, _viewport.w, false );
+  };
+
+  this.setSize = function ( width, height, updateStyle ) {
+    _width = width;
+    _height = height;
+
+    _canvas.width = Math.floor(width * _pixelRatio);
+    _canvas.height = Math.floor(height * _pixelRatio);
+
+    if ( updateStyle !== false ) {
+      _canvas.style.width = width + 'px';
+      _canvas.style.height = height + 'px';
+    }
+
+    this.setViewport( 0, 0, width, height );
+  };
+
+  this.setViewport = function ( x, y, width, height ) {
+    state.viewport( _viewport.set( x, y, width, height ) );
+  };
+
+  // Clearing
+
+  this.getClearColor = function () {
+    return _clearColor;
+  };
+
+  this.setClearColor = function ( color, alpha ) {
+    _clearColor.set( color );
+
+    _clearAlpha = alpha !== undefined ? alpha : 1;
+
+    state.buffers.color.setClear( _clearColor.r, _clearColor.g, _clearColor.b, _clearAlpha, _premultipliedAlpha );
+  };
+
+  this.clear = function ( color, depth ) {
+    let bits = 0;
+
+    if ( color === undefined || color ) bits |= _gl.COLOR_BUFFER_BIT;
+    if ( depth === undefined || depth ) bits |= _gl.DEPTH_BUFFER_BIT;
+
+    if ( bits !== 0 ) {
+      _gl.clear( bits );
+    }
+  };
+
+  this.clearColor = function () {
+    this.clear( true, false );
+  };
+
+  this.clearDepth = function () {
+    this.clear( false, true );
+  };
+
+  // Reset
+
+  this.resetGLState = resetGLState;
+
+  this.dispose = function () {
+    transparentObjects = [];
+    transparentObjectsLastIndex = -1;
+    opaqueObjects = [];
+    opaqueObjectsLastIndex = -1;
+
+    _canvas.removeEventListener( 'webglcontextlost', onContextLost, false );
+  };
+
+  // Events
+
+  function onContextLost( event ) {
+    event.preventDefault();
+
+    resetGLState();
+    setDefaultGLState();
+
+    properties.clear();
+  }
+
+  function onMaterialDispose( event ) {
+    let material = event.target;
+
+    material.removeEventListener( 'dispose', onMaterialDispose );
+
+    deallocateMaterial( material );
+  }
+
+  // Buffer deallocation
+
+  function deallocateMaterial( material ) {
+    releaseMaterialProgramReference( material );
+
+    properties.delete( material );
+  }
+
+
+  function releaseMaterialProgramReference( material ) {
+    let programInfo = properties.get( material ).program;
+
+    material.program = undefined;
+
+    if ( programInfo !== undefined ) {
+      programCache.releaseProgram( programInfo );
+    }
+  }
+
+  // Buffer rendering
+
+
+  this.renderBufferDirect = function ( camera, fog, geometry, material, object, group ) {
+    setMaterial( material );
+
+    let program = setProgram( camera, fog, material, object );
+
+    let updateBuffers = false;
+    let geometryProgram = geometry.id + '_' + program.id;
+
+    if ( geometryProgram !== _currentGeometryProgram ) {
+      _currentGeometryProgram = geometryProgram;
+      updateBuffers = true;
+    }
+
+    //
+
+    let index = geometry.index;
+    let position = geometry.attributes.position;
+    let rangeFactor = 1;
+
+    let renderer;
+
+    if ( index !== null ) {
+      renderer = indexedBufferRenderer;
+      renderer.setIndex( index );
+    } else {
+      renderer = bufferRenderer;
+    }
+
+    if ( updateBuffers ) {
+      setupVertexAttributes( material, program, geometry );
+
+      if ( index !== null ) {
+        _gl.bindBuffer( _gl.ELEMENT_ARRAY_BUFFER, objects.getAttributeBuffer( index ) );
+      }
+    }
+
+    //
+
+    let dataCount = 0;
+
+    if ( index !== null ) {
+      dataCount = index.count;
+    } else if ( position !== undefined ) {
+      dataCount = position.count;
+    }
+
+    let rangeStart = geometry.drawRange.start * rangeFactor;
+    let rangeCount = geometry.drawRange.count * rangeFactor;
+
+    let groupStart = group !== null ? group.start * rangeFactor : 0;
+    let groupCount = group !== null ? group.count * rangeFactor : Infinity;
+
+    let drawStart = Math.max( rangeStart, groupStart );
+    let drawEnd = Math.min( dataCount, rangeStart + rangeCount, groupStart + groupCount ) - 1;
+
+    let drawCount = Math.max( 0, drawEnd - drawStart + 1 );
+
+    if ( drawCount === 0 ) return;
+
+    //
+
+    if ( object.isMesh ) {
+      renderer.setMode( _gl.TRIANGLES );
+    } else if ( object.isLine ) {
+      let lineWidth = material.linewidth;
+      if ( lineWidth === undefined ) lineWidth = 1; // Not using Line*Material
+      state.setLineWidth( lineWidth * getTargetPixelRatio() );
+
+      if ( object.isLineSegments ) {
+        renderer.setMode( _gl.LINES );
+      } else {
+        renderer.setMode( _gl.LINE_STRIP );
+      }
+    } else if ( object.isPoints ) {
+      renderer.setMode( _gl.POINTS );
+    }
+
+    renderer.render( drawStart, drawCount );
+  };
+
+  function setupVertexAttributes( material, program, geometry, startIndex ) {
+    if ( startIndex === undefined ) startIndex = 0;
+
+    state.initAttributes();
+
+    let geometryAttributes = geometry.attributes;
+
+    let programAttributes = program.getAttributes();
+
+    for ( let name in programAttributes ) {
+      let programAttribute = programAttributes[name];
+
+      if ( programAttribute >= 0 ) {
+        let geometryAttribute = geometryAttributes[name];
+
+        if ( geometryAttribute !== undefined ) {
+          let normalized = geometryAttribute.normalized;
+          let size = geometryAttribute.itemSize;
+
+          let attributeProperties = objects.getAttributeProperties( geometryAttribute );
+
+          let buffer = attributeProperties.__webglBuffer;
+          let type = attributeProperties.type;
+          let bytesPerElement = attributeProperties.bytesPerElement;
+
+          state.enableAttribute( programAttribute );
+
+          _gl.bindBuffer( _gl.ARRAY_BUFFER, buffer );
+          _gl.vertexAttribPointer( programAttribute, size, type, normalized, 0, startIndex * size * bytesPerElement );
+        } else {
+          console.error( 'undefined geometryAttribute' );
+        }
+      }
+    }
+    state.disableUnusedAttributes();
+  }
+
+  // Sorting
+
+  function painterSortStable( a, b ) {
+    if ( a.object.renderOrder !== b.object.renderOrder ) {
+      return a.object.renderOrder - b.object.renderOrder;
+    } else if ( a.material.program && b.material.program && a.material.program !== b.material.program ) {
+      return a.material.program.id - b.material.program.id;
+    } else if ( a.material.id !== b.material.id ) {
+      return a.material.id - b.material.id;
+    } else if ( a.z !== b.z ) {
+      return a.z - b.z;
+    } else {
+      return a.id - b.id;
+    }
+  }
+
+  function reversePainterSortStable( a, b ) {
+    if ( a.object.renderOrder !== b.object.renderOrder ) {
+      return a.object.renderOrder - b.object.renderOrder;
+    } if ( a.z !== b.z ) {
+      return b.z - a.z;
+    } else {
+      return a.id - b.id;
+    }
+  }
+
+  // Rendering
+
+  this.render = function ( scene, camera, renderTarget, forceClear ) {
+    if ( camera !== undefined && camera.isCamera !== true ) {
+      console.error( 'camera is not an instance of Camera.' );
+      return;
+    }
+
+    // reset caching for this frame
+
+    _currentGeometryProgram = '';
+    _currentMaterialId = -1;
+    _currentCamera = null;
+
+    // update scene graph
+
+    if ( scene.matrixWorldAutoUpdate === true ) scene.updateMatrixWorld();
+
+    // update camera matrices and frustum
+
+    if ( camera.parent === null ) camera.updateMatrixWorld();
+
+    camera.matrixWorldInverse.copy( camera.matrixWorld ).invert();
+
+    _projScreenMatrix.multiplyMatrices( camera.projectionMatrix, camera.matrixWorldInverse );
+
+    opaqueObjectsLastIndex = -1;
+    transparentObjectsLastIndex = -1;
+
+    projectObject( scene );
+
+    opaqueObjects.length = opaqueObjectsLastIndex + 1;
+    transparentObjects.length = transparentObjectsLastIndex + 1;
+
+    if ( _this.sortObjects === true ) {
+      opaqueObjects.sort( painterSortStable );
+      transparentObjects.sort( reversePainterSortStable );
+    }
+
+    //
+
+    _infoRender.calls = 0;
+    _infoRender.vertices = 0;
+    _infoRender.faces = 0;
+    _infoRender.points = 0;
+
+    this.setRenderTarget( );
+
+    state.buffers.color.setClear( _clearColor.r, _clearColor.g, _clearColor.b, _clearAlpha, _premultipliedAlpha );
+
+    if ( this.autoClear || forceClear ) {
+      this.clear( this.autoClearColor, this.autoClearDepth );
+    }
+
+    // opaque pass (front-to-back order)
+
+    state.setBlending( NoBlending );
+    renderObjects( opaqueObjects, scene, camera );
+
+    // transparent pass (back-to-front order)
+
+    renderObjects( transparentObjects, scene, camera );
+
+    // Ensure depth buffer writing is enabled so it can be cleared on next render
+
+    state.setDepthTest( true );
+    state.setDepthWrite( true );
+
+    // _gl.finish();
+  };
+
+  function pushRenderItem( object, geometry, material, z, group ) {
+    let array, index;
+
+    // allocate the next position in the appropriate array
+
+    if ( material.transparent ) {
+      array = transparentObjects;
+      index = ++ transparentObjectsLastIndex;
+    } else {
+      array = opaqueObjects;
+      index = ++ opaqueObjectsLastIndex;
+    }
+
+    // recycle existing render item or grow the array
+
+    let renderItem = array[index];
+
+    if ( renderItem !== undefined ) {
+      renderItem.id = object.id;
+      renderItem.object = object;
+      renderItem.geometry = geometry;
+      renderItem.material = material;
+      renderItem.z = _vector3.z;
+      renderItem.group = group;
+    } else {
+      renderItem = {
+        id: object.id,
+        object: object,
+        geometry: geometry,
+        material: material,
+        z: _vector3.z,
+        group: group,
+      };
+
+      // assert( index === array.length );
+      array.push( renderItem );
+    }
+  }
+
+  function projectObject( object ) {
+    if ( object.visible === false ) return;
+
+    if ( object.isMesh || object.isLine || object.isPoints ) {
+      let material = object.material;
+
+      if ( material.visible === true ) {
+        if ( _this.sortObjects === true ) {
+          _vector3.setFromMatrixPosition( object.matrixWorld );
+          _vector3.applyMatrix4( _projScreenMatrix );
+        }
+
+        let geometry = objects.update( object );
+
+        pushRenderItem( object, geometry, material, _vector3.z, null );
+      }
+    }
+
+    let children = object.children;
+
+    for ( let i = 0, l = children.length; i < l; i ++ ) {
+      projectObject( children[i] );
+    }
+  }
+
+  function renderObjects( renderList, scene, camera, overrideMaterial ) {
+    for ( let i = 0, l = renderList.length; i < l; i ++ ) {
+      let renderItem = renderList[i];
+      let object = renderItem.object;
+      let geometry = renderItem.geometry;
+      let material = renderItem.material ;
+      let group = renderItem.group;
+
+      object.modelViewMatrix.multiplyMatrices( camera.matrixWorldInverse, object.matrixWorld );
+      _this.renderBufferDirect( camera, scene.fog, geometry, material, object, group );
+    }
+  }
+
+  function initMaterial( material, fog, object ) {
+    let materialProperties = properties.get( material );
+
+    let parameters = programCache.getParameters(
+      material, fog, object );
+
+    let code = programCache.getProgramCode( material, parameters );
+
+    let program = materialProperties.program;
+    let programChange = true;
+
+    if ( program === undefined ) {
+      // new material
+      material.addEventListener( 'dispose', onMaterialDispose );
+    } else if ( program.code !== code ) {
+      // changed glsl or parameters
+      releaseMaterialProgramReference( material );
+    } else {
+      // only rebuild uniform list
+      programChange = false;
+    }
+
+    if ( programChange ) {
+      materialProperties.__webglShader = {
+        name: material.type,
+        uniforms: material.uniforms,
+        vertexShader: material.vertexShader,
+        fragmentShader: material.fragmentShader,
+      };
+
+      material.__webglShader = materialProperties.__webglShader;
+
+      program = programCache.acquireProgram( material, parameters, code );
+
+      materialProperties.program = program;
+      material.program = program;
+    }
+
+    let uniforms = materialProperties.__webglShader.uniforms;
+
+    materialProperties.fog = fog;
+
+    let progUniforms = materialProperties.program.getUniforms(),
+      uniformsList =
+      WebGLUniforms.seqWithValue( progUniforms.seq, uniforms );
+
+    materialProperties.uniformsList = uniformsList;
+  }
+
+  function setMaterial( material ) {
+    material.transparent === true ?
+      state.setBlending( NormalBlending, material.premultipliedAlpha )
+      : state.setBlending( NoBlending );
+
+    state.setDepthTest( material.depthTest );
+    state.setDepthWrite( material.depthWrite );
+  }
+
+  function setProgram( camera, fog, material, object ) {
+    textures.resetTextureUnits();
+
+    let materialProperties = properties.get( material );
+
+    if ( material.needsUpdate === false ) {
+      if ( materialProperties.program === undefined ) {
+        material.needsUpdate = true;
+      } else if ( material.fog && materialProperties.fog !== fog ) {
+        material.needsUpdate = true;
+      }
+    }
+
+    if ( material.needsUpdate ) {
+      initMaterial( material, fog, object );
+      material.needsUpdate = false;
+    }
+
+    let refreshProgram = false;
+    let refreshMaterial = false;
+
+    let program = materialProperties.program,
+      p_uniforms = program.getUniforms(),
+      m_uniforms = materialProperties.__webglShader.uniforms;
+
+    if ( program.id !== _currentProgram ) {
+      _gl.useProgram( program.program );
+      _currentProgram = program.id;
+
+      refreshProgram = true;
+      refreshMaterial = true;
+    }
+
+    if ( material.id !== _currentMaterialId ) {
+      _currentMaterialId = material.id;
+
+      refreshMaterial = true;
+    }
+
+    if ( refreshProgram || camera !== _currentCamera ) {
+      p_uniforms.setValue(_gl, 'projectionMatrix', camera.projectionMatrix);
+
+      if ( camera !== _currentCamera ) {
+        _currentCamera = camera;
+
+        // lighting uniforms depend on the camera so enforce an update
+        // now, in case this material supports lights - or later, when
+        // the next material that does gets activated:
+
+        refreshMaterial = true;   // set to true on material change
+      }
+
+      // load material specific uniforms
+      // (shader material also gets them for the sake of genericity)
+
+      if ( material.isShaderMaterial ) {
+        p_uniforms.setValue( _gl, 'viewMatrix', camera.matrixWorldInverse );
+      }
+    }
+
+    if ( refreshMaterial ) {
+      // refresh uniforms common to several materials
+
+      if ( fog && material.fog ) {
+        refreshUniformsFog( m_uniforms, fog );
+      }
+
+      // refresh single material specific uniforms
+
+      WebGLUniforms.upload(
+        _gl, materialProperties.uniformsList, m_uniforms, textures );
+    }
+
+
+    // common matrices
+
+    p_uniforms.setValue(_gl, 'modelViewMatrix', object.modelViewMatrix);
+    p_uniforms.setValue( _gl, 'modelMatrix', object.matrixWorld );
+
+    return program;
+  }
+
+  // Uniforms (refresh uniforms objects)
+
+  function refreshUniformsFog( uniforms, fog ) {
+    uniforms.fogColor.value = fog.color;
+    if ( fog.isFog ) {
+      uniforms.fogNear.value = fog.near;
+      uniforms.fogFar.value = fog.far;
+    }
+  }
+
+  this.setRenderTarget = function ( ) {
+    _currentRenderTarget = null;
+    _currentViewport.copy( _viewport ).multiplyScalar( _pixelRatio );
+    state.viewport( _currentViewport );
+  };
+}
+
+// scenes/Fog.js
+class Fog {
+  constructor(color, near = 1, far = 1000) {
+    this.isFog = true;
+    this.name = '';
+    this.color = new Color(color);
+    this.near = near;
+    this.far = far;
+  }
+}
+
+
+// scenes/Scene.js
+class Scene extends Object3D {
+  constructor() {
+    super();
+    this.type = 'Scene';
+    this.fog = null;
+  }
+}
+
+
+// objects/Line.js
+class Line extends Object3D {
+  constructor(geometry, material) {
+    super();
+    this.isLine = true;
+    this.type = 'Line';
+    this.geometry = geometry;
+    this.material = material;
+  }
+}
+
+
+// objects/LineSegments.js
+class LineSegments extends Line {
+  constructor(geometry, material) {
+    super(geometry, material);
+    this.isLineSegments = true;
+    this.type = 'LineSegments';
+  }
+}
+
+
+// objects/Points.js
+class Points extends Object3D {
+  constructor(geometry, material) {
+    super();
+    this.isPoints = true;
+    this.type = 'Points';
+    this.geometry = geometry;
+    this.material = material;
+  }
+}
+
+// Copyright 2010-2023 Three.js Authors
+// SPDX-License-Identifier: MIT
+
+
+// from extras/core/Curve.js
+class Curve {
+  constructor() {
+    this.type = 'Curve';
+    this.arcLengthDivisions = 200;
+  }
+
+  getPoints(divisions = 5) {
+    const points = [];
+    for (let d = 0; d <= divisions; d++) {
+      points.push(this.getPoint(d / divisions));
+    }
+    return points;
+  }
+}
+
+// from extras/curves/CatmullRomCurve3.js
+/**
+ * Centripetal CatmullRom Curve - which is useful for avoiding
+ * cusps and self-intersections in non-uniform catmull rom curves.
+ * http://www.cemyuksel.com/research/catmullrom_param/catmullrom.pdf
+ *
+ * curve.type accepts centripetal(default), chordal and catmullrom
+ * curve.tension is used for catmullrom which defaults to 0.5
+ */
+
+/*
+Based on an optimized c++ solution in
+ - http://stackoverflow.com/questions/9489736/catmull-rom-curve-with-no-cusps-and-no-self-intersections/
+ - http://ideone.com/NoEbVM
+
+This CubicPoly class could be used for reusing some variables and calculations,
+but for three.js curve use, it could be possible inlined and flatten into a single function call
+which can be placed in CurveUtils.
+*/
+
+function CubicPoly() {
+  let c0 = 0,
+    c1 = 0,
+    c2 = 0,
+    c3 = 0;
+
+  /*
+   * Compute coefficients for a cubic polynomial
+   *   p(s) = c0 + c1*s + c2*s^2 + c3*s^3
+   * such that
+   *   p(0) = x0, p(1) = x1
+   *  and
+   *   p'(0) = t0, p'(1) = t1.
+   */
+  function init(x0, x1, t0, t1) {
+    c0 = x0;
+    c1 = t0;
+    c2 = -3 * x0 + 3 * x1 - 2 * t0 - t1;
+    c3 = 2 * x0 - 2 * x1 + t0 + t1;
+  }
+
+  return {
+    initCatmullRom: function (x0, x1, x2, x3, tension) {
+      init(x1, x2, tension * (x2 - x0), tension * (x3 - x1));
+    },
+
+    initNonuniformCatmullRom: function (x0, x1, x2, x3, dt0, dt1, dt2) {
+      // compute tangents when parameterized in [t1,t2]
+      let t1 = (x1 - x0) / dt0 - (x2 - x0) / (dt0 + dt1) + (x2 - x1) / dt1;
+      let t2 = (x2 - x1) / dt1 - (x3 - x1) / (dt1 + dt2) + (x3 - x2) / dt2;
+
+      // rescale tangents for parametrization in [0,1]
+      t1 *= dt1;
+      t2 *= dt1;
+
+      init(x1, x2, t1, t2);
+    },
+
+    calc: function (t) {
+      const t2 = t * t;
+      const t3 = t2 * t;
+      return c0 + c1 * t + c2 * t2 + c3 * t3;
+    },
+  };
+}
+
+//
+
+const tmp = /*@__PURE__*/ new Vector3();
+const px = /*@__PURE__*/ new CubicPoly();
+const py = /*@__PURE__*/ new CubicPoly();
+const pz = /*@__PURE__*/ new CubicPoly();
+
+class CatmullRomCurve3 extends Curve {
+  constructor(points = [], closed = false, curveType = 'centripetal', tension = 0.5) {
+    super();
+
+    this.isCatmullRomCurve3 = true;
+
+    this.type = 'CatmullRomCurve3';
+
+    this.points = points;
+    this.closed = closed;
+    this.curveType = curveType;
+    this.tension = tension;
+  }
+
+  getPoint(t, optionalTarget = new Vector3()) {
+    const point = optionalTarget;
+
+    const points = this.points;
+    const l = points.length;
+
+    const p = (l - (this.closed ? 0 : 1)) * t;
+    let intPoint = Math.floor(p);
+    let weight = p - intPoint;
+
+    if (this.closed) {
+      intPoint += intPoint > 0 ? 0 : (Math.floor(Math.abs(intPoint) / l) + 1) * l;
+    } else if (weight === 0 && intPoint === l - 1) {
+      intPoint = l - 2;
+      weight = 1;
+    }
+
+    let p0, p3; // 4 points (p1 & p2 defined below)
+
+    if (this.closed || intPoint > 0) {
+      p0 = points[(intPoint - 1) % l];
+    } else {
+      // extrapolate first point
+      tmp.subVectors(points[0], points[1]).add(points[0]);
+      p0 = tmp;
+    }
+
+    const p1 = points[intPoint % l];
+    const p2 = points[(intPoint + 1) % l];
+
+    if (this.closed || intPoint + 2 < l) {
+      p3 = points[(intPoint + 2) % l];
+    } else {
+      // extrapolate last point
+      tmp.subVectors(points[l - 1], points[l - 2]).add(points[l - 1]);
+      p3 = tmp;
+    }
+
+    if (this.curveType === 'centripetal' || this.curveType === 'chordal') {
+      // init Centripetal / Chordal Catmull-Rom
+      const pow = this.curveType === 'chordal' ? 0.5 : 0.25;
+      let dt0 = Math.pow(p0.distanceToSquared(p1), pow);
+      let dt1 = Math.pow(p1.distanceToSquared(p2), pow);
+      let dt2 = Math.pow(p2.distanceToSquared(p3), pow);
+
+      // safety check for repeated points
+      if (dt1 < 1e-4) dt1 = 1.0;
+      if (dt0 < 1e-4) dt0 = dt1;
+      if (dt2 < 1e-4) dt2 = dt1;
+
+      px.initNonuniformCatmullRom(p0.x, p1.x, p2.x, p3.x, dt0, dt1, dt2);
+      py.initNonuniformCatmullRom(p0.y, p1.y, p2.y, p3.y, dt0, dt1, dt2);
+      pz.initNonuniformCatmullRom(p0.z, p1.z, p2.z, p3.z, dt0, dt1, dt2);
+    } else if (this.curveType === 'catmullrom') {
+      px.initCatmullRom(p0.x, p1.x, p2.x, p3.x, this.tension);
+      py.initCatmullRom(p0.y, p1.y, p2.y, p3.y, this.tension);
+      pz.initCatmullRom(p0.z, p1.z, p2.z, p3.z, this.tension);
+    }
+
+    point.set(px.calc(weight), py.calc(weight), pz.calc(weight));
+
+    return point;
+  }
+}
+
+const CUBE_EDGES =
+  [[0, 0, 0], [1, 0, 0],
+   [0, 0, 0], [0, 1, 0],
+   [0, 0, 0], [0, 0, 1],
+   [1, 0, 0], [1, 1, 0],
+   [1, 0, 0], [1, 0, 1],
+   [0, 1, 0], [1, 1, 0],
+   [0, 1, 0], [0, 1, 1],
+   [0, 0, 1], [1, 0, 1],
+   [0, 0, 1], [0, 1, 1],
+   [1, 0, 1], [1, 1, 1],
+   [1, 1, 0], [1, 1, 1],
+   [0, 1, 1], [1, 1, 1]];
+
+function makeColorAttribute(colors) {
+  const col = new Float32Array(colors.length * 3);
+  for (let i = 0; i < colors.length; i++) {
+    col[3*i+0] = colors[i].r;
+    col[3*i+1] = colors[i].g;
+    col[3*i+2] = colors[i].b;
+  }
+  return new BufferAttribute(col, 3);
+}
+
+const light_dir = new Vector3(-0.2, 0.3, 1.0); // length affects brightness
+
+const fog_pars_fragment =
+`#ifdef USE_FOG
+uniform vec3 fogColor;
+uniform float fogNear;
+uniform float fogFar;
+#endif`;
+
+const fog_end_fragment =
+`#ifdef USE_FOG
+  float depth = gl_FragCoord.z / gl_FragCoord.w;
+  float fogFactor = smoothstep(fogNear, fogFar, depth);
+  gl_FragColor.rgb = mix(gl_FragColor.rgb, fogColor, fogFactor);
+#endif`;
+
+
+const varcolor_vert = `
+attribute vec3 color;
+varying vec3 vcolor;
+void main() {
+  vcolor = color;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}
+`;
+
+const unicolor_vert = `
+void main() {
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}
+`;
+
+const unicolor_frag = `
+${fog_pars_fragment}
+uniform vec3 vcolor;
+void main() {
+  gl_FragColor = vec4(vcolor, 1.0);
+${fog_end_fragment}
+}`;
+
+const varcolor_frag = `
+${fog_pars_fragment}
+varying vec3 vcolor;
+void main() {
+  gl_FragColor = vec4(vcolor, 1.0);
+${fog_end_fragment}
+}`;
+
+function makeLines(pos, color, linewidth) {
+  const material = new ShaderMaterial({
+    uniforms: makeUniforms({vcolor: color}),
+    vertexShader: unicolor_vert,
+    fragmentShader: unicolor_frag,
+    fog: true,
+    linewidth: linewidth,
+    type: 'um_lines',
+  });
+  const geometry = new BufferGeometry();
+  geometry.setAttribute('position', new BufferAttribute(pos, 3));
+  return new LineSegments(geometry, material);
+}
+
+
+
+
+
+
+function makeCube(size, ctr, options) {
+  const pos = new Float32Array(CUBE_EDGES.length * 3);
+  for (let i = 0; i < CUBE_EDGES.length; i++) {
+    const coor = CUBE_EDGES[i];
+    pos[3*i+0] = ctr.x + size * (coor[0] - 0.5);
+    pos[3*i+1] = ctr.y + size * (coor[1] - 0.5);
+    pos[3*i+2] = ctr.z + size * (coor[2] - 0.5);
+  }
+  return makeLines(pos, options.color, options.linewidth);
+}
+
+function makeMultiColorLines(pos,
+                                    colors,
+                                    linewidth) {
+  const material = new ShaderMaterial({
+    uniforms: makeUniforms({}),
+    vertexShader: varcolor_vert,
+    fragmentShader: varcolor_frag,
+    fog: true,
+    linewidth: linewidth,
+    type: 'um_multicolor_lines',
+  });
+  const geometry = new BufferGeometry();
+  geometry.setAttribute('position', new BufferAttribute(pos, 3));
+  geometry.setAttribute('color', makeColorAttribute(colors));
+  return new LineSegments(geometry, material);
+}
+
+// A cube with 3 edges (for x, y, z axes) colored in red, green and blue.
+function makeRgbBox(transform_func, color) {
+  const pos = new Float32Array(CUBE_EDGES.length * 3);
+  for (let i = 0; i < CUBE_EDGES.length; i++) {
+    const coor = transform_func(CUBE_EDGES[i]);
+    pos[3*i+0] = coor[0];
+    pos[3*i+1] = coor[1];
+    pos[3*i+2] = coor[2];
+  }
+  const colors = [
+    new Color(0xff0000), new Color(0xffaa00),
+    new Color(0x00ff00), new Color(0xaaff00),
+    new Color(0x0000ff), new Color(0x00aaff),
+  ];
+  for (let j = 6; j < CUBE_EDGES.length; j++) {
+    colors.push(color);
+  }
+  return makeMultiColorLines(pos, colors, 1);
+}
+
+function double_pos(pos) {
+  const double_pos = [];
+  for (let i = 0; i < pos.length; i++) {
+    const v = pos[i];
+    double_pos.push(v[0], v[1], v[2]);
+    double_pos.push(v[0], v[1], v[2]);
+  }
+  return double_pos;
+}
+
+function double_color(color_arr) {
+  const len = color_arr.length;
+  const color = new Float32Array(6*len);
+  for (let i = 0; i < len; i++) {
+    const col = color_arr[i];
+    color[6*i] = col.r;
+    color[6*i+1] = col.g;
+    color[6*i+2] = col.b;
+    color[6*i+3] = col.r;
+    color[6*i+4] = col.g;
+    color[6*i+5] = col.b;
+  }
+  return color;
+}
+
+// draw quads as 2 triangles: 4 attributes / quad, 6 indices / quad
+function make_quad_index_buffer(len) {
+  const index = (4*len < 65536 ? new Uint16Array(6*len)
+                               : new Uint32Array(6*len));
+  const vert_order = [0, 1, 2, 0, 2, 3];
+  for (let i = 0; i < len; i++) {
+    for (let j = 0; j < 6; j++) {
+      index[6*i+j] = 4*i + vert_order[j];
+    }
+  }
+  return new BufferAttribute(index, 1);
+}
+
+
+const wide_segments_vert = `
+attribute vec3 color;
+attribute vec3 other;
+attribute float side;
+uniform vec2 win_size;
+uniform float linewidth;
+varying vec3 vcolor;
+
+void main() {
+  vcolor = color;
+  mat4 mat = projectionMatrix * modelViewMatrix;
+  vec2 dir = normalize((mat * vec4(position - other, 0.0)).xy);
+  vec2 normal = vec2(-dir.y, dir.x);
+  gl_Position = mat * vec4(position, 1.0);
+  gl_Position.xy += side * linewidth * normal / win_size;
+}`;
+
+function interpolate_vertices(segment, smooth) {
+  const vertices = [];
+  for (let i = 0; i < segment.length; i++) {
+    const xyz = segment[i].xyz;
+    vertices.push(new Vector3(xyz[0], xyz[1], xyz[2]));
+  }
+  if (!smooth || smooth < 2) return vertices;
+  const curve = new CatmullRomCurve3(vertices);
+  return curve.getPoints((segment.length - 1) * smooth);
+}
+
+function interpolate_colors(colors, smooth) {
+  if (!smooth || smooth < 2) return colors;
+  const ret = [];
+  for (let i = 0; i < colors.length - 1; i++) {
+    for (let j = 0; j < smooth; j++) {
+      // currently we don't really interpolate colors
+      ret.push(colors[i]);
+    }
+  }
+  ret.push(colors[colors.length - 1]);
+  return ret;
+}
+
+// a simplistic linear interpolation, no need to SLERP
+function interpolate_directions(dirs, smooth) {
+  smooth = smooth || 1;
+  const ret = [];
+  let i;
+  for (i = 0; i < dirs.length - 1; i++) {
+    const p = dirs[i];
+    const n = dirs[i+1];
+    for (let j = 0; j < smooth; j++) {
+      const an = j / smooth;
+      const ap = 1 - an;
+      ret.push(ap*p[0] + an*n[0], ap*p[1] + an*n[1], ap*p[2] + an*n[2]);
+    }
+  }
+  ret.push(dirs[i][0], dirs[i][1], dirs[i][2]);
+  return ret;
+}
+
+function makeUniforms(params) {
+  const uniforms = {
+    fogNear: { value: null },  // will be updated in setProgram()
+    fogFar: { value: null },
+    fogColor: { value: null },
+  };
+  for (const [p, v] of Object.entries(params)) {
+    uniforms[p] = { value: v };
+  }
+  return uniforms;
+}
+
+const ribbon_vert = `
+attribute vec3 color;
+attribute vec3 tan;
+uniform float shift;
+varying vec3 vcolor;
+void main() {
+  vcolor = color;
+  vec3 pos = position + shift * normalize(tan);
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
+}`;
+
+// 9-line ribbon
+function makeRibbon(vertices,
+                           colors,
+                           tangents,
+                           smoothness) {
+  const vertex_arr = interpolate_vertices(vertices, smoothness);
+  const color_arr = interpolate_colors(colors, smoothness);
+  const tang_arr = interpolate_directions(tangents, smoothness);
+  const obj = new Object3D();
+  const geometry = new BufferGeometry();
+  const pos = new Float32Array(vertex_arr.length * 3);
+  for (let i = 0; i < vertex_arr.length; i++) {
+    const v = vertex_arr[i];
+    pos[3*i+0] = v.x;
+    pos[3*i+1] = v.y;
+    pos[3*i+2] = v.z;
+  }
+  geometry.setAttribute('position', new BufferAttribute(pos, 3));
+  geometry.setAttribute('color', makeColorAttribute(color_arr));
+  const tan = new Float32Array(tang_arr);
+  geometry.setAttribute('tan', new BufferAttribute(tan, 3));
+  for (let n = -4; n < 5; n++) {
+    const material = new ShaderMaterial({
+      uniforms: makeUniforms({shift: 0.1 * n}),
+      vertexShader: ribbon_vert,
+      fragmentShader: varcolor_frag,
+      fog: true,
+      type: 'um_ribbon',
+    });
+    obj.add(new Line(geometry, material));
+  }
+  return obj;
+}
+
+
+function makeChickenWire(data,
+                         options) {
+  const geom = new BufferGeometry();
+  const position = new Float32Array(data.vertices);
+  geom.setAttribute('position', new BufferAttribute(position, 3));
+
+  // Although almost all browsers support OES_element_index_uint nowadays,
+  // use Uint32 indexes only when needed.
+  const arr = (data.vertices.length < 3*65536 ? new Uint16Array(data.segments)
+                                              : new Uint32Array(data.segments));
+  //console.log('arr len:', data.vertices.length, data.segments.length);
+  geom.setIndex(new BufferAttribute(arr, 1));
+  const material = new ShaderMaterial({
+    uniforms: makeUniforms({vcolor: options.color}),
+    vertexShader: unicolor_vert,
+    fragmentShader: unicolor_frag,
+    fog: true,
+    linewidth: options.linewidth,
+    type: 'um_line_chickenwire',
+  });
+  return new LineSegments(geom, material);
+}
+
+
+const grid_vert = `
+uniform vec3 ucolor;
+uniform vec3 fogColor;
+varying vec4 vcolor;
+void main() {
+  vec2 scale = vec2(projectionMatrix[0][0], projectionMatrix[1][1]);
+  float z = position.z;
+  float fogFactor = (z > 0.5 ? 0.2 : 0.7);
+  float alpha = 0.8 * smoothstep(z > 1.5 ? -10.0 : 0.01, 0.1, scale.y);
+  vcolor = vec4(mix(ucolor, fogColor, fogFactor), alpha);
+  gl_Position = vec4(position.xy * scale, -0.99, 1.0);
+}`;
+
+const grid_frag = `
+varying vec4 vcolor;
+void main() {
+  gl_FragColor = vcolor;
+}`;
+
+function makeGrid() {
+  const N = 50;
+  const pos = [];
+  for (let i = -N; i <= N; i++) {
+    let z = 0; // z only marks major/minor axes
+    if (i % 5 === 0) z = i % 2 === 0 ? 2 : 1;
+    pos.push(-N, i, z, N, i, z);  // horizontal line
+    pos.push(i, -N, z, i, N, z);  // vertical line
+  }
+  const geom = new BufferGeometry();
+  const pos_arr = new Float32Array(pos);
+  geom.setAttribute('position', new BufferAttribute(pos_arr, 3));
+  const material = new ShaderMaterial({
+    uniforms: makeUniforms({ucolor: new Color(0x888888)}),
+    //linewidth: 3,
+    vertexShader: grid_vert,
+    fragmentShader: grid_frag,
+    fog: true, // no really, but we use fogColor
+    type: 'um_grid',
+  });
+  material.transparent = true;
+  const obj = new LineSegments(geom, material);
+  obj.frustumCulled = false;  // otherwise the renderer could skip it
+  return obj;
+}
+
+
+function makeLineMaterial(options) {
+  const uniforms = makeUniforms({
+    linewidth: options.linewidth,
+    win_size: options.win_size,
+  });
+  return new ShaderMaterial({
+    uniforms: uniforms,
+    vertexShader: wide_segments_vert,
+    fragmentShader: varcolor_frag,
+    fog: true,
+    type: 'um_line',
+  });
+}
+
+// vertex_arr and color_arr must be of the same length
+function makeLineSegments(material,
+                                 vertex_arr,
+                                 color_arr) {
+  // n input vertices => 2n output vertices, n triangles, 3n indexes
+  const len = vertex_arr.length;
+  const pos = double_pos(vertex_arr);
+  const position = new Float32Array(pos);
+  const other_vert = new Float32Array(6*len);
+  for (let i = 0; i < 6 * len; i += 12) {
+    let j = 0;
+    for (; j < 6; j++) other_vert[i+j] = pos[i+j+6];
+    for (; j < 12; j++) other_vert[i+j] = pos[i+j-6];
+  }
+  const side = new Float32Array(2*len);
+  for (let k = 0; k < len; k++) {
+    side[2*k] = -1;
+    side[2*k+1] = 1;
+  }
+  const geometry = new BufferGeometry();
+  geometry.setAttribute('position', new BufferAttribute(position, 3));
+  geometry.setAttribute('other', new BufferAttribute(other_vert, 3));
+  geometry.setAttribute('side', new BufferAttribute(side, 1));
+  if (color_arr != null) {
+    const color = double_color(color_arr);
+    geometry.setAttribute('color', new BufferAttribute(color, 3));
+  }
+  geometry.setIndex(make_quad_index_buffer(len/2));
+
+  const mesh = new Mesh(geometry, material);
+  //mesh.userData.bond_lines = true;
+  return mesh;
+}
+
+const wheel_vert = `
+attribute vec3 color;
+uniform float size;
+varying vec3 vcolor;
+void main() {
+  vcolor = color;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  gl_PointSize = size;
+}`;
+
+// not sure how portable it is
+const wheel_frag = `
+${fog_pars_fragment}
+varying vec3 vcolor;
+void main() {
+  vec2 diff = gl_PointCoord - vec2(0.5, 0.5);
+  if (dot(diff, diff) >= 0.25) discard;
+  gl_FragColor = vec4(vcolor, 1.0);
+${fog_end_fragment}
+}`;
+
+function makeWheels(atom_arr, color_arr, size) {
+  const geometry = new BufferGeometry();
+  const pos = new Float32Array(atom_arr.length * 3);
+  for (let i = 0; i < atom_arr.length; i++) {
+    const xyz = atom_arr[i].xyz;
+    pos[3*i+0] = xyz[0];
+    pos[3*i+1] = xyz[1];
+    pos[3*i+2] = xyz[2];
+  }
+  geometry.setAttribute('position', new BufferAttribute(pos, 3));
+  geometry.setAttribute('color', makeColorAttribute(color_arr));
+  const material = new ShaderMaterial({
+    uniforms: makeUniforms({size: size}),
+    vertexShader: wheel_vert,
+    fragmentShader: wheel_frag,
+    fog: true,
+    type: 'um_wheel',
+  });
+  const obj = new Points(geometry, material);
+  return obj;
+}
+
+// For the ball-and-stick rendering we use so-called imposters.
+// This technique was described in:
+// http://doi.ieeecomputersociety.org/10.1109/TVCG.2006.115
+// free copy here:
+// http://vcg.isti.cnr.it/Publications/2006/TCM06/Tarini_FinalVersionElec.pdf
+// and was nicely summarized in:
+// http://www.sunsetlakesoftware.com/2011/05/08/enhancing-molecules-using-opengl-es-20
+
+const sphere_vert = `
+attribute vec3 color;
+attribute vec2 corner;
+uniform float radius;
+varying vec3 vcolor;
+varying vec2 vcorner;
+varying vec3 vpos;
+
+void main() {
+  vcolor = color;
+  vcorner = corner;
+  vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+  vpos = mvPosition.xyz;
+  mvPosition.xy += corner * radius;
+  gl_Position = projectionMatrix * mvPosition;
+}
+`;
+
+// based on 3Dmol imposter shaders
+const sphere_frag = `
+${fog_pars_fragment}
+uniform mat4 projectionMatrix;
+uniform vec3 lightDir;
+uniform float radius;
+varying vec3 vcolor;
+varying vec2 vcorner;
+varying vec3 vpos;
+
+void main() {
+  float sq = dot(vcorner, vcorner);
+  if (sq > 1.0) discard;
+  float z = sqrt(1.0-sq);
+  vec3 xyz = vec3(vcorner.x, vcorner.y, z);
+  vec4 projPos = projectionMatrix * vec4(vpos + radius * xyz, 1.0);
+  gl_FragDepthEXT = 0.5 * ((gl_DepthRange.diff * (projPos.z / projPos.w)) +
+                           gl_DepthRange.near + gl_DepthRange.far);
+  float weight = clamp(dot(xyz, lightDir), 0.0, 1.0) * 0.8 + 0.2;
+  gl_FragColor = vec4(weight * vcolor, 1.0);
+  ${fog_end_fragment}
+}
+`;
+
+const stick_vert = `
+attribute vec3 color;
+attribute vec3 axis;
+attribute vec2 corner;
+uniform float radius;
+varying vec3 vcolor;
+varying vec2 vcorner;
+varying vec3 vpos;
+varying vec3 vaxis;
+
+void main() {
+  vcolor = color;
+  vcorner = corner;
+  vaxis = normalize((modelViewMatrix * vec4(axis, 0.0)).xyz);
+  vec2 normal = normalize(vec2(-vaxis.y, vaxis.x));
+  vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+  vpos = mvPosition.xyz;
+  mvPosition.xy += corner[1] * radius * normal;
+  gl_Position = projectionMatrix * mvPosition;
+}`;
+
+const stick_frag = `
+${fog_pars_fragment}
+uniform mat4 projectionMatrix;
+uniform vec3 lightDir;
+uniform float radius;
+varying vec3 vcolor;
+varying vec2 vcorner;
+varying vec3 vpos;
+varying vec3 vaxis;
+void main() {
+  float central = 1.0 - vcorner[1] * vcorner[1];
+  vec4 pos = vec4(vpos, 1.0);
+  pos.z += radius * vaxis.z * central;
+  vec4 projPos = projectionMatrix * pos;
+  gl_FragDepthEXT = 0.5 * ((gl_DepthRange.diff * (projPos.z / projPos.w)) +
+                           gl_DepthRange.near + gl_DepthRange.far);
+  float weight = length(cross(vaxis, lightDir)) * central * 0.8 + 0.2;
+  gl_FragColor = vec4(min(weight, 1.0) * vcolor, 1.0);
+${fog_end_fragment}
+}`;
+
+function makeSticks(vertex_arr, color_arr, radius) {
+  const uniforms = makeUniforms({
+    radius: radius,
+    lightDir: light_dir,
+  });
+  const material = new ShaderMaterial({
+    uniforms: uniforms,
+    vertexShader: stick_vert,
+    fragmentShader: stick_frag,
+    fog: true,
+    type: 'um_stick',
+  });
+  material.extensions.fragDepth = true;
+
+  const len = vertex_arr.length;
+  const pos = double_pos(vertex_arr);
+  const position = new Float32Array(pos);
+  const axis = new Float32Array(6*len);
+  for (let i = 0; i < 6 * len; i += 12) {
+    for (let j = 0; j < 6; j++) axis[i+j] = pos[i+j+6] - pos[i+j];
+    for (let j = 0; j < 6; j++) axis[i+j+6] = axis[i+j];
+  }
+  const geometry = new BufferGeometry();
+  geometry.setAttribute('position', new BufferAttribute(position, 3));
+  const corner = new Float32Array(4*len);
+  for (let i = 0; 2 * i < len; i++) {
+    corner[8*i + 0] = -1;  // 0
+    corner[8*i + 1] = -1;  // 0
+    corner[8*i + 2] = -1;  // 1
+    corner[8*i + 3] = 1;  // 1
+    corner[8*i + 4] = 1;  // 2
+    corner[8*i + 5] = 1;  // 2
+    corner[8*i + 6] = 1;  // 3
+    corner[8*i + 7] = -1;  // 3
+  }
+  geometry.setAttribute('axis', new BufferAttribute(axis, 3));
+  geometry.setAttribute('corner', new BufferAttribute(corner, 2));
+  const color = double_color(color_arr);
+  geometry.setAttribute('color', new BufferAttribute(color, 3));
+  geometry.setIndex(make_quad_index_buffer(len/2));
+
+  const mesh = new Mesh(geometry, material);
+  //mesh.userData.bond_lines = true;
+  return mesh;
+}
+
+function makeBalls(atom_arr, color_arr, radius) {
+  const N = atom_arr.length;
+  const geometry = new BufferGeometry();
+
+  const pos = new Float32Array(N * 4 * 3);
+  for (let i = 0; i < N; i++) {
+    const xyz = atom_arr[i].xyz;
+    for (let j = 0; j < 4; j++) {
+      for (let k = 0; k < 3; k++) {
+        pos[3 * (4*i + j) + k] = xyz[k];
+      }
+    }
+  }
+  geometry.setAttribute('position', new BufferAttribute(pos, 3));
+
+  const corner = new Float32Array(N * 4 * 2);
+  for (let i = 0; i < N; i++) {
+    corner[8*i + 0] = -1;  // 0
+    corner[8*i + 1] = -1;  // 0
+    corner[8*i + 2] = -1;  // 1
+    corner[8*i + 3] = 1;  // 1
+    corner[8*i + 4] = 1;  // 2
+    corner[8*i + 5] = 1;  // 2
+    corner[8*i + 6] = 1;  // 3
+    corner[8*i + 7] = -1;  // 3
+  }
+  geometry.setAttribute('corner', new BufferAttribute(corner, 2));
+
+  const colors = new Float32Array(N * 4 * 3);
+  for (let i = 0; i < N; i++) {
+    const col = color_arr[i];
+    for (let j = 0; j < 4; j++) {
+      colors[3 * (4*i + j) + 0] = col.r;
+      colors[3 * (4*i + j) + 1] = col.g;
+      colors[3 * (4*i + j) + 2] = col.b;
+    }
+  }
+  geometry.setAttribute('color', new BufferAttribute(colors, 3));
+
+  geometry.setIndex(make_quad_index_buffer(N));
+
+  const material = new ShaderMaterial({
+    uniforms: makeUniforms({
+      radius: radius,
+      lightDir: light_dir,
+    }),
+    vertexShader: sphere_vert,
+    fragmentShader: sphere_frag,
+    fog: true,
+    type: 'um_sphere',
+  });
+  material.extensions.fragDepth = true;
+  const obj = new Mesh(geometry, material);
+  return obj;
+}
+
+const label_vert = `
+attribute vec2 uvs;
+uniform vec2 canvas_size;
+uniform vec2 win_size;
+uniform float z_shift;
+varying vec2 vUv;
+void main() {
+  vUv = uvs;
+  vec2 rel_offset = vec2(0.02, -0.3);
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  gl_Position.xy += (uvs + rel_offset) * 2.0 * canvas_size / win_size;
+  gl_Position.z += z_shift * projectionMatrix[2][2];
+}`;
+
+const label_frag = `
+${fog_pars_fragment}
+varying vec2 vUv;
+uniform sampler2D map;
+void main() {
+  gl_FragColor = texture2D(map, vUv);
+${fog_end_fragment}
+}`;
+
+class Label {
+  
+  
+
+  constructor(text, options) {
+    this.texture = new Texture();
+    const canvas_size = this.redraw(text, options);
+    if (canvas_size === undefined) return;
+
+    // Rectangle geometry.
+    const geometry = new BufferGeometry();
+    const pos = options.pos;
+    const position = new Float32Array([].concat(pos, pos, pos, pos));
+    const uvs = new Float32Array([0, 1, 1, 1, 0, 0, 1, 0]);
+    const indices = new Uint16Array([0, 2, 1, 2, 3, 1]);
+    geometry.setIndex(new BufferAttribute(indices, 1));
+    geometry.setAttribute('position', new BufferAttribute(position, 3));
+    geometry.setAttribute('uvs', new BufferAttribute(uvs, 2));
+
+    const material = new ShaderMaterial({
+      uniforms: makeUniforms({map: this.texture,
+                              canvas_size: canvas_size,
+                              win_size: options.win_size,
+                              z_shift: options.z_shift}),
+      vertexShader: label_vert,
+      fragmentShader: label_frag,
+      fog: true,
+      type: 'um_label',
+    });
+    material.transparent = true;
+    this.mesh = new Mesh(geometry, material);
+  }
+
+  redraw(text, options) {
+    if (typeof document === 'undefined') return;  // for testing on node
+    const canvas = document.createElement('canvas');
+    // Canvas size should be 2^N.
+    canvas.width = 256;  // arbitrary limit, to keep it simple
+    canvas.height = 16;  // font size
+    const context = canvas.getContext('2d');
+    if (!context) return null;
+    context.font = (options.font || 'bold 14px') + ' sans-serif';
+    //context.fillStyle = 'green';
+    //context.fillRect(0, 0, canvas.width, canvas.height);
+    context.textBaseline = 'bottom';
+    if (options.color) context.fillStyle = options.color;
+    context.fillText(text, 0, canvas.height);
+    this.texture.image = canvas;
+    this.texture.needsUpdate = true;
+    return [canvas.width, canvas.height];
+  }
+}
+
+
+// Add vertices of a 3d cross (representation of an unbonded atom)
+function addXyzCross(vertices, xyz, r) {
+  vertices.push([xyz[0]-r, xyz[1], xyz[2]], [xyz[0]+r, xyz[1], xyz[2]]);
+  vertices.push([xyz[0], xyz[1]-r, xyz[2]], [xyz[0], xyz[1]+r, xyz[2]]);
+  vertices.push([xyz[0], xyz[1], xyz[2]-r], [xyz[0], xyz[1], xyz[2]+r]);
+}
+
+// Properties defined with Object.defineProperties() in JS are not understood
+// by TypeScript; add them here.
+ 
+
+
+
+
+
+
+// map 2d position to sphere with radius 1.
+function project_on_ball(x, y) {
+  let z = 0;
+  const length_sq = x * x + y * y;
+  if (length_sq < 1) {  // in ellipse
+    z = Math.sqrt(1.0 - length_sq);
+  } else {  // in a corner
+    const length = Math.sqrt(length_sq);
+    x /= length;
+    y /= length;
+  }
+  return [x, y, z];  // guaranteed to be normalized
+}
+
+// object used in computations (to avoid creating and deleting it)
+const _m1 = new Matrix4();
+
+const STATE = { NONE: -1, ROTATE: 0, PAN: 1, ZOOM: 2, PAN_ZOOM: 3,
+                       SLAB: 4, ROLL: 5, AUTO_ROTATE: 6, GO: 7 };
+
+const auto_speed = 1.0;
+
+// based on three.js/examples/js/controls/OrthographicTrackballControls.js
+class Controls {
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+
+  constructor(camera, target) {
+    this._camera = camera;
+    this._target = target;
+    this._state = STATE.NONE;
+    this._rotate_start = new Vector3();
+    this._rotate_end = new Vector3();
+    this._zoom_start = [0, 0];
+    this._zoom_end = [0, 0];
+    this._pinch_start = 0;
+    this._pinch_end = 0;
+    this._pan_start = [0, 0];
+    this._pan_end = [0, 0];
+    this._panned = true;
+    this._rotating = 0.0;
+    this._auto_stamp = null;
+    this._go_func = null;
+
+    // the far plane is more distant from the target than the near plane (3:1)
+    this.slab_width = [2.5, 7.5, null];
+  }
+
+  _rotate_camera(eye) {
+    const quat = new Quaternion();
+    quat.setFromUnitVectors(this._rotate_end, this._rotate_start);
+    eye.applyQuaternion(quat);
+    this._camera.up.applyQuaternion(quat);
+    this._rotate_end.applyQuaternion(quat);
+    this._rotate_start.copy(this._rotate_end);
+  }
+
+  _zoom_camera(eye) {
+    const dx = this._zoom_end[0] - this._zoom_start[0];
+    const dy = this._zoom_end[1] - this._zoom_start[1];
+    if (this._state === STATE.ZOOM) {
+      this._camera.zoom /= (1 - dx + dy);
+    } else if (this._state === STATE.SLAB) {
+      this._target.addScaledVector(eye, -5 / eye.length() * dy);
+    } else if (this._state === STATE.ROLL) {
+      const quat = new Quaternion();
+      quat.setFromAxisAngle(eye, 0.05 * (dx - dy));
+      this._camera.up.applyQuaternion(quat);
+    }
+    this._zoom_start[0] = this._zoom_end[0];
+    this._zoom_start[1] = this._zoom_end[1];
+    return this._state === STATE.SLAB ? 10*dx : null;
+  }
+
+  _pan_camera(eye) {
+    let dx = this._pan_end[0] - this._pan_start[0];
+    let dy = this._pan_end[1] - this._pan_start[1];
+    dx *= 0.5 * (this._camera.right - this._camera.left) / this._camera.zoom;
+    dy *= 0.5 * (this._camera.bottom - this._camera.top) / this._camera.zoom;
+    const pan = eye.clone().cross(this._camera.up).setLength(dx);
+    pan.addScaledVector(this._camera.up, dy / this._camera.up.length());
+    this._camera.position.add(pan);
+    this._target.add(pan);
+    this._pan_start[0] = this._pan_end[0];
+    this._pan_start[1] = this._pan_end[1];
+  }
+
+  _auto_rotate(eye) {
+    this._rotate_start.copy(eye).normalize();
+    const now = Date.now();
+    const elapsed = (this._auto_stamp !== null ? now - this._auto_stamp : 16.7);
+    let speed = 1.8e-5 * elapsed * auto_speed;
+    this._auto_stamp = now;
+    if (this._rotating === true) {
+      speed = -speed;
+    } else if (this._rotating !== false) {
+      this._rotating += 0.02;
+      speed = 4e-5 * auto_speed * Math.cos(this._rotating);
+    }
+    this._rotate_end.crossVectors(this._camera.up, eye).multiplyScalar(speed)
+      .add(this._rotate_start);
+  }
+
+  toggle_auto(param) {
+    if (this._state === STATE.AUTO_ROTATE &&
+        typeof param === typeof this._rotating) {
+      this._state = STATE.NONE;
+    } else {
+      this._state = STATE.AUTO_ROTATE;
+      this._auto_stamp = null;
+      this._rotating = param;
+    }
+  }
+
+  is_going() { return this._state === STATE.GO; }
+
+  is_moving() { return this._state !== STATE.NONE; }
+
+  update() {
+    let changed = false;
+    const eye = this._camera.position.clone().sub(this._target);
+    if (this._state === STATE.AUTO_ROTATE) {
+      this._auto_rotate(eye);
+    }
+    if (!this._rotate_start.equals(this._rotate_end)) {
+      this._rotate_camera(eye);
+      changed = true;
+    }
+    if (this._pinch_end !== this._pinch_start) {
+      this._camera.zoom *= this._pinch_end / this._pinch_start;
+      this._pinch_start = this._pinch_end;
+      changed = true;
+    }
+    if (this._zoom_end[0] !== this._zoom_start[0] ||
+        this._zoom_end[1] !== this._zoom_start[1]) {
+      const dslab = this._zoom_camera(eye);
+      if (dslab) {
+        this.slab_width[0] = Math.max(this.slab_width[0] + dslab, 0.01);
+        this.slab_width[1] = Math.max(this.slab_width[1] + dslab, 0.01);
+      }
+      changed = true;
+    }
+    if (this._pan_end[0] !== this._pan_start[0] ||
+        this._pan_end[1] !== this._pan_start[1]) {
+      this._pan_camera(eye);
+      this._panned = true;
+      changed = true;
+    }
+    this._camera.position.addVectors(this._target, eye);
+    if (this._state === STATE.GO && this._go_func) {
+      this._go_func();
+      changed = true;
+    }
+    //this._camera.lookAt(this._target);
+    _m1.lookAt(this._camera.position, this._target, this._camera.up);
+    this._camera.quaternion.setFromRotationMatrix(_m1);
+    return changed;
+  }
+
+  start(new_state, x, y, dist) {
+    if (this._state === STATE.NONE || this._state === STATE.AUTO_ROTATE) {
+      this._state = new_state;
+    }
+    this.move(x, y, dist);
+    switch (this._state) {
+      case STATE.ROTATE:
+        this._rotate_start.copy(this._rotate_end);
+        break;
+      case STATE.ZOOM:
+      case STATE.SLAB:
+      case STATE.ROLL:
+        this._zoom_start[0] = this._zoom_end[0];
+        this._zoom_start[1] = this._zoom_end[1];
+        break;
+      case STATE.PAN:
+        this._pan_start[0] = this._pan_end[0];
+        this._pan_start[1] = this._pan_end[1];
+        this._panned = false;
+        break;
+      case STATE.PAN_ZOOM:
+        this._pinch_start = this._pinch_end;
+        this._pan_start[0] = this._pan_end[0];
+        this._pan_start[1] = this._pan_end[1];
+        break;
+    }
+  }
+
+  move(x, y, dist) {
+    switch (this._state) {
+      case STATE.ROTATE: {
+        const xyz = project_on_ball(x, y);
+        //console.log(this._camera.projectionMatrix);
+        //console.log(this._camera.matrixWorld);
+        // TODO maybe use project()/unproject()/applyProjection()
+        const eye = this._camera.position.clone().sub(this._target);
+        const up = this._camera.up;
+        this._rotate_end.crossVectors(up, eye).setLength(xyz[0]);
+        this._rotate_end.addScaledVector(up, xyz[1] / up.length());
+        this._rotate_end.addScaledVector(eye, xyz[2] / eye.length());
+        break;
+      }
+      case STATE.ZOOM:
+      case STATE.SLAB:
+      case STATE.ROLL:
+        this._zoom_end = [x, y];
+        break;
+      case STATE.PAN:
+        this._pan_end = [x, y];
+        break;
+      case STATE.PAN_ZOOM:
+        if (dist == null) return; // should not happen
+        this._pan_end = [x, y];
+        this._pinch_end = dist;
+        break;
+    }
+  }
+
+  // returned coordinates can be used for atom picking
+  stop() {
+    let ret = null;
+    if (this._state === STATE.PAN && !this._panned) ret = this._pan_end;
+    this._state = STATE.NONE;
+    this._rotate_start.copy(this._rotate_end);
+    this._pinch_start = this._pinch_end;
+    this._pan_start[0] = this._pan_end[0];
+    this._pan_start[1] = this._pan_end[1];
+    return ret;
+  }
+
+  // cam_up (if set) must be orthogonal to the view
+  go_to(targ, cam_pos, cam_up, steps) {
+    if ((!targ || targ.distanceToSquared(this._target) < 0.001) &&
+        (!cam_pos || cam_pos.distanceToSquared(this._camera.position) < 0.1) &&
+        (!cam_up || cam_up.distanceToSquared(this._camera.up) < 0.1)) {
+      return;
+    }
+    this._state = STATE.GO;
+    steps = (steps || 60) / auto_speed;
+    const alphas = [];
+    let prev_pos = 0;
+    for (let i = 1; i <= steps; ++i) {
+      let pos = i / steps;
+      // quadratic easing
+      pos = pos < 0.5 ? 2 * pos * pos : -2 * pos * (pos-2) - 1;
+      alphas.push((pos - prev_pos) / (1 - prev_pos));
+      prev_pos = pos;
+    }
+    this._go_func = function () {
+      const a = alphas.shift();
+      if (targ) {
+        // unspecified cam_pos - _camera stays in the same distance to _target
+        if (!cam_pos) this._camera.position.sub(this._target);
+        this._target.lerp(targ, a);
+        if (!cam_pos) this._camera.position.add(this._target);
+      }
+      if (cam_pos) this._camera.position.lerp(cam_pos, a);
+      if (cam_up) this._camera.up.lerp(cam_up, a);
+      if (alphas.length === 0) {
+        this._state = STATE.NONE;
+        this._go_func = null;
+      }
+    };
+  }
+}
+
+const ColorSchemes$1 = {
+  // the default scheme that generally mimicks Coot
+  'coot dark': {
+    bg: new Color(0x000000),
+    fg: new Color(0xFFFFFF),
+    map_den: new Color(0x3362B2),
+    map_pos: new Color(0x298029),
+    map_neg: new Color(0x8B2E2E),
+    center: new Color(0xC997B0),
+    // atoms
+    H: new Color(0x858585), // H is normally invisible
+    // C, N and O are taken approximately (by color-picker) from coot
+    C: new Color(0xb3b300),
+    N: new Color(0x7EAAFB),
+    O: new Color(0xF24984),
+    S: new Color(0x40ff40), // S in coot is too similar to C, here it's greener
+    // Coot doesn't define other colors (?)
+    MG: new Color(0xc0c0c0),
+    P:  new Color(0xffc040),
+    CL: new Color(0xa0ff60),
+    CA: new Color(0xffffff),
+    MN: new Color(0xff90c0),
+    FE: new Color(0xa03000),
+    NI: new Color(0x00ff80),
+    def: new Color(0xa0a0a0), // default atom color
+  },
+
+  // scheme made of "solarized" colors (http://ethanschoonover.com/solarized):
+  // base03  base02  base01  base00  base0   base1   base2   base3
+  // #002b36 #073642 #586e75 #657b83 #839496 #93a1a1 #eee8d5 #fdf6e3
+  // yellow  orange  red     magenta violet  blue    cyan    green
+  // #b58900 #cb4b16 #dc322f #d33682 #6c71c4 #268bd2 #2aa198 #859900
+  'solarized dark': {
+    bg: new Color(0x002b36),
+    fg: new Color(0xfdf6e3),
+    map_den: new Color(0x268bd2),
+    map_pos: new Color(0x859900),
+    map_neg: new Color(0xd33682),
+    center: new Color(0xfdf6e3),
+    H: new Color(0x586e75),
+    C: new Color(0x93a1a1),
+    N: new Color(0x6c71c4),
+    O: new Color(0xcb4b16),
+    S: new Color(0xb58900),
+    def: new Color(0xeee8d5),
+  },
+
+  'solarized light': {
+    bg: new Color(0xfdf6e3),
+    fg: new Color(0x002b36),
+    map_den: new Color(0x268bd2),
+    map_pos: new Color(0x859900),
+    map_neg: new Color(0xd33682),
+    center: new Color(0x002b36),
+    H: new Color(0x93a1a1),
+    C: new Color(0x586e75),
+    N: new Color(0x6c71c4),
+    O: new Color(0xcb4b16),
+    S: new Color(0xb58900),
+    def: new Color(0x073642),
+  },
+
+  // like in Coot after Edit > Background Color > White
+  'coot light': {
+    bg: new Color(0xFFFFFF),
+    fg: new Color(0x000000),
+    map_den: new Color(0x3362B2),
+    map_pos: new Color(0x298029),
+    map_neg: new Color(0x8B2E2E),
+    center: new Color(0xC7C769),
+    H: new Color(0x999999),
+    C: new Color(0xA96464),
+    N: new Color(0x1C51B3),
+    O: new Color(0xC33869),
+    S: new Color(0x9E7B3D),
+    def: new Color(0x808080),
+  },
+};
+
+
+const INIT_HUD_TEXT = 'This is GemmiMol not Coot. ' +
+  '<a href="#" onclick="V.toggle_help(); return false;">H shows help.</a>';
+
+// options handled by select_next()
+
+const COLOR_PROPS = ['element', 'B-factor', 'pLDDT', 'occupancy', 'index', 'chain'];
+const RENDER_STYLES = ['sticks', 'lines', 'backbone', 'ribbon', 'ball&stick'];
+const LIGAND_STYLES = ['ball&stick', 'sticks', 'lines'];
+const WATER_STYLES = ['cross', 'dot', 'invisible'];
+const MAP_STYLES = ['marching cubes', 'squarish'/*, 'snapped MC'*/];
+const LABEL_FONTS = ['bold 14px', '14px', '16px', 'bold 16px'];
+function rainbow_value(v, vmin, vmax) {
+  const c = new Color(0xe0e0e0);
+  if (vmin < vmax) {
+    const ratio = (v - vmin) / (vmax - vmin);
+    const hue = (240 - (240 * ratio)) / 360;
+    c.setHSL(hue, 1.0, 0.5);
+  }
+  return c;
+}
+
+function color_by(prop, atoms, elem_colors,
+                  hue_shift) {
+  let color_func;
+  const last_atom = atoms[atoms.length-1];
+  if (prop === 'index') {
+    color_func = function (atom) {
+      return rainbow_value(atom.i_seq, 0, last_atom.i_seq);
+    };
+  } else if (prop === 'B-factor') {
+    let vmin = Infinity;
+    let vmax = -Infinity;
+    for (let i = 0; i < atoms.length; i++) {
+      const v = atoms[i].b;
+      if (v > vmax) vmax = v;
+      if (v < vmin) vmin = v;
+    }
+    //console.log('B-factors in [' + vmin + ', ' + vmax + ']');
+    color_func = function (atom) {
+      return rainbow_value(atom.b, vmin, vmax);
+    };
+  } else if (prop === 'pLDDT') {
+    const steps = [90, 70, 50];
+    const colors = [
+      new Color(0x0053d6), // dark blue
+      new Color(0x65cbf3), // light blue
+      new Color(0xffdb13), // yellow
+      new Color(0xff7d45)  // orange
+    ];
+    color_func = function (atom) {
+      let i = 0;
+      while (i < 3 && atom.b < steps[i]) {
+        ++i;
+      }
+      return colors[i];
+    };
+  } else if (prop === 'occupancy') {
+    color_func = function (atom) {
+      return rainbow_value(atom.occ, 0, 1);
+    };
+  } else if (prop === 'chain') {
+    color_func = function (atom) {
+      return rainbow_value(atom.chain_index, 0, last_atom.chain_index);
+    };
+  } else { // element
+    if (hue_shift === 0) {
+      color_func = function (atom) {
+        return elem_colors[atom.element] || elem_colors.def;
+      };
+    } else {
+      const c_hsl = { h: 0, s: 0, l: 0 };
+      elem_colors['C'].getHSL(c_hsl);
+      const c_col = new Color(0, 0, 0);
+      c_col.setHSL(c_hsl.h + hue_shift, c_hsl.s, c_hsl.l);
+      color_func = function (atom) {
+        const el = atom.element;
+        return el === 'C' ? c_col : (elem_colors[el] || elem_colors.def);
+      };
+    }
+  }
+  return atoms.map(color_func);
+}
+
+function scale_by_height(value, size) { // for scaling bond_line
+  return value * size[1] / 700;
+}
+
+class MapBag {
+  
+  
+  
+  
+  
+  
+  
+
+  constructor(map, config, is_diff_map) {
+    this.map = map;
+    this.name = '';
+    this.isolevel = is_diff_map ? 3.0 : config.default_isolevel;
+    this.visible = true;
+    this.types = is_diff_map ? ['map_pos', 'map_neg'] : ['map_den'];
+    this.block_ctr = new Vector3(Infinity, 0, 0);
+    this.el_objects = []; // three.js objects
+  }
+}
+
+class ModelBag {
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+
+  constructor(model, config, win_size) {
+    this.model = model;
+    this.label = '(model #' + ++ModelBag.ctor_counter + ')';
+    this.visible = true;
+    this.hue_shift = 0;
+    this.conf = config;
+    this.win_size = win_size;
+    this.objects = []; // list of three.js objects
+    this.atom_array = [];
+    this.gemmi_selection = null;
+  }
+
+  get_visible_atoms() {
+    const atoms = this.model.atoms;
+    if (this.conf.hydrogens || !this.model.has_hydrogens) {
+      return atoms;
+    }
+    // with filter() it's twice slower (on Node 4.2)
+    //return atoms.filter(function(a) { return a.element !== 'H'; });
+    const non_h = [];
+    for (const atom of atoms) {
+      if (atom.element !== 'H') non_h.push(atom);
+    }
+    return non_h;
+  }
+
+  add_bonds(polymers, ligands, ball_size) {
+    const visible_atoms = this.get_visible_atoms();
+    const colors = color_by(this.conf.color_prop, visible_atoms,
+                            this.conf.colors, this.hue_shift);
+    const vertex_arr = [];
+    const color_arr = [];
+    const bond_type_arr = [];
+    const metal_vertex_arr = [];
+    const metal_color_arr = [];
+    const metal_bond_type_arr = [];
+    const sphere_arr = [];
+    const sphere_color_arr = [];
+    const metal_color = this.conf.colors.center;
+    const hydrogens = this.conf.hydrogens;
+    for (let i = 0; i < visible_atoms.length; i++) {
+      const atom = visible_atoms[i];
+      const color = colors[i];
+      if (!(atom.is_ligand ? ligands : polymers)) continue;
+      if (atom.is_water() && this.conf.water_style === 'invisible') continue;
+      if (atom.bonds.length === 0 && ball_size == null) { // nonbonded - cross
+        if (!atom.is_water() || this.conf.water_style === 'cross') {
+          addXyzCross(vertex_arr, atom.xyz, 0.7);
+          for (let n = 0; n < 6; n++) {
+            color_arr.push(color);
+          }
+        }
+      } else { // bonded, draw lines
+        for (let j = 0; j < atom.bonds.length; j++) {
+          const other = this.model.atoms[atom.bonds[j]];
+          if (!hydrogens && other.element === 'H') continue;
+          // Coot show X-H bonds as thinner lines in a single color.
+          // Here we keep it simple and render such bonds like all others.
+          const bond_type = atom.bond_types[j];
+          if (bond_type === BondType.Metal) {
+            const mid = ball_size == null ?
+              atom.midpoint(other) :
+              this.bond_half_end(atom, other, ball_size * 0.3);
+            metal_vertex_arr.push(atom.xyz, mid);
+            metal_color_arr.push(metal_color, metal_color);
+            metal_bond_type_arr.push(bond_type, bond_type);
+          } else {
+            const mid = ball_size == null ?
+              atom.midpoint(other) :
+              this.bond_half_end(atom, other, ball_size / 2);
+            vertex_arr.push(atom.xyz, mid);
+            color_arr.push(color, color);
+            bond_type_arr.push(bond_type, bond_type);
+          }
+        }
+      }
+      sphere_arr.push(atom);
+      sphere_color_arr.push(color);
+    }
+
+    if (ball_size != null) {
+      if (vertex_arr.length !== 0) {
+        const obj = makeSticks(vertex_arr, color_arr, ball_size / 2);
+        obj.userData.bond_types = bond_type_arr;
+        this.objects.push(obj);
+      }
+      if (metal_vertex_arr.length !== 0) {
+        const metal_obj = makeSticks(metal_vertex_arr, metal_color_arr,
+                                     ball_size * 0.3);
+        metal_obj.userData.bond_types = metal_bond_type_arr;
+        this.objects.push(metal_obj);
+      }
+      if (sphere_arr.length !== 0) {
+        this.objects.push(makeBalls(sphere_arr, sphere_color_arr, ball_size));
+      }
+    } else if (vertex_arr.length !== 0 || metal_vertex_arr.length !== 0) {
+      const linewidth = scale_by_height(this.conf.bond_line, this.win_size);
+      if (vertex_arr.length !== 0) {
+        const material = makeLineMaterial({
+          linewidth: linewidth,
+          win_size: this.win_size,
+        });
+        const obj = makeLineSegments(material, vertex_arr, color_arr);
+        obj.userData.bond_types = bond_type_arr;
+        this.objects.push(obj);
+      }
+      if (metal_vertex_arr.length !== 0) {
+        const metal_material = makeLineMaterial({
+          linewidth: linewidth * 0.6,
+          win_size: this.win_size,
+        });
+        const metal_obj = makeLineSegments(metal_material, metal_vertex_arr,
+                                           metal_color_arr);
+        metal_obj.userData.bond_types = metal_bond_type_arr;
+        this.objects.push(metal_obj);
+      }
+      // wheels (discs) as round caps
+      this.objects.push(makeWheels(sphere_arr, sphere_color_arr, linewidth));
+    }
+
+    sphere_arr.forEach(function (v) { this.atom_array.push(v); }, this);
+  }
+
+  add_sticks(polymers, ligands, radius) {
+    const visible_atoms = this.get_visible_atoms();
+    const colors = color_by(this.conf.color_prop, visible_atoms,
+                            this.conf.colors, this.hue_shift);
+    const vertex_arr = [];
+    const color_arr = [];
+    const bond_type_arr = [];
+    const metal_vertex_arr = [];
+    const metal_color_arr = [];
+    const metal_bond_type_arr = [];
+    const atom_arr = [];
+    const metal_color = this.conf.colors.center;
+    const hydrogens = this.conf.hydrogens;
+    for (let i = 0; i < visible_atoms.length; i++) {
+      const atom = visible_atoms[i];
+      const color = colors[i];
+      if (!(atom.is_ligand ? ligands : polymers)) continue;
+      if (atom.is_water() && this.conf.water_style === 'invisible') continue;
+      atom_arr.push(atom);
+      if (atom.bonds.length === 0) continue;
+      for (let j = 0; j < atom.bonds.length; j++) {
+        const other = this.model.atoms[atom.bonds[j]];
+        if (!hydrogens && other.element === 'H') continue;
+        const bond_type = atom.bond_types[j];
+        if (bond_type === BondType.Metal) {
+          const mid = this.bond_half_end(atom, other, radius * 0.6);
+          metal_vertex_arr.push(atom.xyz, mid);
+          metal_color_arr.push(metal_color, metal_color);
+          metal_bond_type_arr.push(bond_type, bond_type);
+        } else if (bond_type === BondType.Double) {
+          this.add_offset_stick(vertex_arr, color_arr, bond_type_arr,
+                                atom, other, color, bond_type,
+                                radius * 0.75, radius);
+          this.add_offset_stick(vertex_arr, color_arr, bond_type_arr,
+                                atom, other, color, bond_type,
+                                -radius * 0.75, radius);
+        } else if (bond_type === BondType.Triple) {
+          const mid = this.bond_half_end(atom, other, radius);
+          vertex_arr.push(atom.xyz, mid);
+          color_arr.push(color, color);
+          bond_type_arr.push(bond_type, bond_type);
+          this.add_offset_stick(vertex_arr, color_arr, bond_type_arr,
+                                atom, other, color, bond_type,
+                                radius * 1.2, radius);
+          this.add_offset_stick(vertex_arr, color_arr, bond_type_arr,
+                                atom, other, color, bond_type,
+                                -radius * 1.2, radius);
+        } else {
+          const mid = this.bond_half_end(atom, other, radius);
+          vertex_arr.push(atom.xyz, mid);
+          color_arr.push(color, color);
+          bond_type_arr.push(bond_type, bond_type);
+        }
+      }
+    }
+    if (vertex_arr.length !== 0) {
+      const obj = makeSticks(vertex_arr, color_arr, radius);
+      obj.userData.bond_types = bond_type_arr;
+      this.objects.push(obj);
+    }
+    if (metal_vertex_arr.length !== 0) {
+      const metal_obj = makeSticks(metal_vertex_arr, metal_color_arr,
+                                   radius * 0.6);
+      metal_obj.userData.bond_types = metal_bond_type_arr;
+      this.objects.push(metal_obj);
+    }
+    this.atom_array = atom_arr;
+  }
+
+  bond_normal(atom, other) {
+    const first = atom.i_seq < other.i_seq ? atom : other;
+    const second = atom.i_seq < other.i_seq ? other : atom;
+    const dir = [
+      second.xyz[0] - first.xyz[0],
+      second.xyz[1] - first.xyz[1],
+      second.xyz[2] - first.xyz[2],
+    ];
+    const ref = (Math.abs(dir[2]) < Math.abs(dir[1])) ? [0, 0, 1] : [0, 1, 0];
+    let normal = [
+      dir[1] * ref[2] - dir[2] * ref[1],
+      dir[2] * ref[0] - dir[0] * ref[2],
+      dir[0] * ref[1] - dir[1] * ref[0],
+    ];
+    const len = Math.sqrt(normal[0] * normal[0] +
+                          normal[1] * normal[1] +
+                          normal[2] * normal[2]);
+    if (len < 1e-6) return [1, 0, 0];
+    normal = [normal[0] / len, normal[1] / len, normal[2] / len];
+    return normal;
+  }
+
+  bond_half_end(atom, other, radius) {
+    const dir = [
+      other.xyz[0] - atom.xyz[0],
+      other.xyz[1] - atom.xyz[1],
+      other.xyz[2] - atom.xyz[2],
+    ];
+    const len = Math.sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+    if (len < 1e-6) return atom.midpoint(other);
+    const overlap = Math.min(radius * 0.5, len * 0.12);
+    const scale = 0.5 + overlap / len;
+    return [
+      atom.xyz[0] + dir[0] * scale,
+      atom.xyz[1] + dir[1] * scale,
+      atom.xyz[2] + dir[2] * scale,
+    ];
+  }
+
+  add_offset_stick(vertex_arr, color_arr, bond_type_arr,
+                   atom, other, color, bond_type,
+                   offset_scale, radius) {
+    const mid = this.bond_half_end(atom, other, radius);
+    const normal = this.bond_normal(atom, other);
+    const offset = [
+      normal[0] * offset_scale,
+      normal[1] * offset_scale,
+      normal[2] * offset_scale,
+    ];
+    vertex_arr.push(
+      [atom.xyz[0] + offset[0], atom.xyz[1] + offset[1], atom.xyz[2] + offset[2]],
+      [mid[0] + offset[0], mid[1] + offset[1], mid[2] + offset[2]],
+    );
+    color_arr.push(color, color);
+    bond_type_arr.push(bond_type, bond_type);
+  }
+
+  extend_stick_segment(start, end, radius) {
+    const dir = [
+      end[0] - start[0],
+      end[1] - start[1],
+      end[2] - start[2],
+    ];
+    const len = Math.sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+    if (len < 1e-6) return [start, end];
+    const overlap = Math.min(radius * 0.35, len * 0.12);
+    const unit = [dir[0] / len, dir[1] / len, dir[2] / len];
+    return [
+      [start[0] - unit[0] * overlap,
+       start[1] - unit[1] * overlap,
+       start[2] - unit[2] * overlap],
+      [end[0] + unit[0] * overlap,
+       end[1] + unit[1] * overlap,
+       end[2] + unit[2] * overlap],
+    ];
+  }
+
+  add_trace() {
+    const segments = this.model.extract_trace();
+    const visible_atoms = [].concat.apply([], segments);
+    const colors = color_by(this.conf.color_prop, visible_atoms,
+                            this.conf.colors, this.hue_shift);
+    const vertex_arr = [];
+    const color_arr = [];
+    let k = 0;
+    const radius = this.conf.stick_radius;
+    for (const seg of segments) {
+      for (let i = 1; i < seg.length; ++i) {
+        const [start, end] = this.extend_stick_segment(seg[i-1].xyz, seg[i].xyz, radius);
+        vertex_arr.push(start, end);
+        color_arr.push(colors[k+i-1], colors[k+i]);
+      }
+      k += seg.length;
+    }
+    if (vertex_arr.length !== 0) {
+      this.objects.push(makeSticks(vertex_arr, color_arr, radius));
+    }
+    this.atom_array = visible_atoms;
+  }
+
+  add_ribbon(smoothness) {
+    const segments = this.model.extract_trace();
+    const res_map = this.model.get_residues();
+    const visible_atoms = [].concat.apply([], segments);
+    const colors = color_by(this.conf.color_prop, visible_atoms,
+                            this.conf.colors, this.hue_shift);
+    let k = 0;
+    for (const seg of segments) {
+      const tangents = [];
+      let last = [0, 0, 0];
+      for (const atom of seg) {
+        const residue = res_map[atom.resid()];
+        const tang = this.model.calculate_tangent_vector(residue);
+        // untwisting (usually applies to beta-strands)
+        if (tang[0]*last[0] + tang[1]*last[1] + tang[2]*last[2] < 0) {
+          tang[0] = -tang[0];
+          tang[1] = -tang[1];
+          tang[2] = -tang[2];
+        }
+        tangents.push(tang);
+        last = tang;
+      }
+      const color_slice = colors.slice(k, k + seg.length);
+      k += seg.length;
+      const obj = makeRibbon(seg, color_slice, tangents, smoothness);
+      this.objects.push(obj);
+    }
+  }
+}
+
+ModelBag.ctor_counter = 0;
+
+function vec3_to_fixed(vec, n) {
+  return [vec.x.toFixed(n), vec.y.toFixed(n), vec.z.toFixed(n)];
+}
+
+// for two-finger touch events
+function touch_info(evt) {
+  const touches = evt.touches;
+  const dx = touches[0].pageX - touches[1].pageX;
+  const dy = touches[0].pageY - touches[1].pageY;
+  return {pageX: (touches[0].pageX + touches[1].pageX) / 2,
+          pageY: (touches[0].pageY + touches[1].pageY) / 2,
+          dist: Math.sqrt(dx * dx + dy * dy)};
+}
+
+// makes sense only for full-window viewer
+function parse_url_fragment() {
+  const ret  = {};
+  if (typeof window === 'undefined') return ret;
+  const params = window.location.hash.substr(1).split('&');
+  for (let i = 0; i < params.length; i++) {
+    const kv = params[i].split('=');
+    const key = kv[0];
+    const val = kv[1];
+    if (key === 'xyz' || key === 'eye') {
+      ret[key] = val.split(',').map(Number);
+    } else if (key === 'zoom') {
+      ret[key] = Number(val);
+    } else {
+      ret[key] = val;
+    }
+  }
+  return ret;
+}
+
+
+class Viewer {
+  
+  
+  
+
+
+
+
+
+  
+  //nav: object | null;
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+
+  constructor(options) {
+    // rendered objects
+    this.model_bags = [];
+    this.map_bags = [];
+    this.decor = {
+      cell_box: null,
+      selection: null,
+      zoom_grid: makeGrid(),
+      mark: null,
+    };
+    this.labels = {};
+    //this.nav = null;
+    this.xhr_headers = {};
+    this.monomer_cif_cache = {};
+    this.last_bonding_info = null;
+    this.gemmi_factory = null;
+    this.gemmi_module = null;
+    this.gemmi_loading = null;
+
+    this.config = {
+      bond_line: 4.0, // ~ to height, like in Coot (see scale_by_height())
+      map_line: 1.25,  // for any height
+      map_radius: 10.0,
+      max_map_radius: 40,
+      default_isolevel: 1.5,
+      center_cube_size: 0.1,
+      map_style: MAP_STYLES[0],
+      render_style: RENDER_STYLES[0],
+      ligand_style: LIGAND_STYLES[0],
+      water_style: WATER_STYLES[0],
+      color_prop: COLOR_PROPS[0],
+      label_font: LABEL_FONTS[0],
+      color_scheme: 'coot dark',
+      // `colors` is assigned in set_colors()
+      hydrogens: false,
+      ball_size: 0.4,
+      stick_radius: 0.08,
+    };
+
+    // options of the constructor overwrite default values of the config
+    for (const o of Object.keys(options)) {
+      if (o in this.config) {
+        this.config[o] = options[o];
+      }
+    }
+    if (options.gemmi) {
+      this.gemmi_module = options.gemmi;
+    } else if (options.gemmi_factory) {
+      this.gemmi_factory = options.gemmi_factory;
+    } else if (typeof globalThis !== 'undefined' &&
+               typeof (globalThis ).Gemmi === 'function') {
+      this.gemmi_factory = (globalThis ).Gemmi;
+    }
+
+    this.set_colors();
+    this.window_size = [1, 1]; // it will be set in resize()
+    this.window_offset = [0, 0];
+
+    this.last_ctr = new Vector3(Infinity, 0, 0);
+    this.selected = {bag: null, atom: null};
+    this.dbl_click_callback = this.toggle_label;
+    this.scene = new Scene();
+    this.scene.fog = new Fog(this.config.colors.bg, 0, 1);
+    this.default_camera_pos = [0, 0, 100];
+    if (options.share_view) {
+      this.target = options.share_view.target;
+      this.camera = options.share_view.camera;
+      this.controls = options.share_view.controls;
+      this.tied_viewer = options.share_view;
+      this.tied_viewer.tied_viewer = this; // not GC friendly
+    } else {
+      this.target = new Vector3(0, 0, 0);
+      this.camera = new OrthographicCamera() ;
+      this.camera.position.fromArray(this.default_camera_pos);
+      this.controls = new Controls(this.camera, this.target);
+    }
+    this.set_common_key_bindings();
+    if (this.constructor === Viewer) this.set_real_space_key_bindings();
+
+    function get_elem(name) {
+      if (options[name] === null || typeof document === 'undefined') return null;
+      return document.getElementById(options[name] || name);
+    }
+    this.hud_el = get_elem('hud');
+    this.container = get_elem('viewer');
+    this.help_el = get_elem('help');
+    this.cid_dialog_el = null;
+    this.cid_input_el = null;
+    this.fps_text = 'FPS: --';
+    this.last_frame_time = 0;
+    this.frame_times = [];
+    if (this.hud_el) {
+      if (this.hud_el.innerHTML === '') this.hud_el.innerHTML = INIT_HUD_TEXT;
+      this.initial_hud_html = this.hud_el.innerHTML;
+    }
+
+    try {
+      this.renderer = new WebGLRenderer({antialias: true});
+    } catch (e2) {
+      this.hud('No WebGL in your browser?', 'ERR');
+      this.renderer = null;
+      return;
+    }
+
+    if (this.container == null) return; // can be null in headless tests
+    this.renderer.setClearColor(this.config.colors.bg, 1);
+    this.renderer.setPixelRatio(window.devicePixelRatio);
+    this.resize();
+    this.camera.zoom = this.camera.right / 35.0;  // arbitrary choice
+    this.update_camera();
+    const el = this.renderer.domElement;
+    this.container.appendChild(el);
+    if (options.focusable) {
+      el.tabIndex = 0;
+    }
+    this.create_cid_dialog();
+    this.decor.zoom_grid.visible = false;
+    this.scene.add(this.decor.zoom_grid);
+
+    window.addEventListener('resize', this.resize.bind(this));
+    const keydown_el = (options.focusable ? el : window);
+    keydown_el.addEventListener('keydown', this.keydown.bind(this));
+    el.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+    el.addEventListener('wheel', this.wheel.bind(this));
+    el.addEventListener('mousedown', this.mousedown.bind(this));
+    el.addEventListener('touchstart', this.touchstart.bind(this));
+    el.addEventListener('touchmove', this.touchmove.bind(this));
+    el.addEventListener('touchend', this.touchend.bind(this));
+    el.addEventListener('touchcancel', this.touchend.bind(this));
+    el.addEventListener('dblclick', this.dblclick.bind(this));
+
+    const self = this;
+
+    this.mousemove = function (event) {
+      event.preventDefault();
+      //event.stopPropagation();
+      self.controls.move(self.relX(event), self.relY(event));
+    };
+
+    this.mouseup = function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      document.removeEventListener('mousemove', self.mousemove);
+      document.removeEventListener('mouseup', self.mouseup);
+      self.decor.zoom_grid.visible = false;
+      const not_panned = self.controls.stop();
+      // special case - centering on atoms after action 'pan' with no shift
+      if (not_panned) {
+        const pick = self.pick_atom(not_panned, self.camera);
+        if (pick != null) {
+          self.select_atom(pick, {steps: 60});
+        }
+      }
+      self.redraw_maps();
+    };
+
+    this.scheduled = false;
+    this.request_render();
+  }
+
+  pick_atom(coords, camera) {
+    let pick = null;
+    for (const bag of this.model_bags) {
+      if (!bag.visible) continue;
+      const z = (camera.near + camera.far) / (camera.near - camera.far);
+      const ray = new Ray();
+      ray.origin.set(coords[0], coords[1], z).unproject(camera);
+      ray.direction.set(0, 0, -1).transformDirection(camera.matrixWorld);
+      const near = camera.near;
+      // '0.15' b/c the furthest 15% is hardly visible in the fog
+      const far = camera.far - 0.15 * (camera.far - camera.near);
+      /*
+      // previous version - line-based search
+      let intersects = [];
+      for (const object of bag.objects) {
+        if (object.visible === false) continue;
+        if (object.userData.bond_lines) {
+          line_raycast(object, {ray, near, far, precision: 0.3}, intersects);
+        }
+      }
+      ...
+      if (intersects.length > 0) {
+        intersects.sort(function (x) { return x.dist2 || Infinity; });
+        const p = intersects[0].point;
+        const atom = bag.model.get_nearest_atom(p.x, p.y, p.z);
+        if (atom != null) {
+          return {bag, atom};
+        }
+      }
+      */
+      // search directly atom array ignoring matrixWorld
+      const vec = new Vector3();
+      // required picking precision: 0.35A at zoom 50, 0.27A @z30, 0.44 @z80
+      const precision2 = 0.35 * 0.35 * 0.02 * camera.zoom;
+      for (const atom of bag.atom_array) {
+        vec.set(atom.xyz[0] - ray.origin.x,
+                atom.xyz[1] - ray.origin.y,
+                atom.xyz[2] - ray.origin.z);
+        const distance = vec.dot(ray.direction);
+        if (distance < 0 || distance < near || distance > far) continue;
+        const diff2 = vec.addScaledVector(ray.direction, -distance).lengthSq();
+        if (diff2 > precision2) continue;
+        if (pick == null || distance < pick.distance) {
+          pick = {bag, atom, distance};
+        }
+      }
+    }
+    return pick;
+  }
+
+  set_colors() {
+    const scheme = this.ColorSchemes[this.config.color_scheme];
+    if (!scheme) throw Error('Unknown color scheme.');
+    this.decor.zoom_grid.material.uniforms.ucolor.value.set(scheme.fg);
+    this.config.colors = scheme;
+    this.redraw_all();
+  }
+
+  // relative position on canvas in normalized device coordinates [-1, +1]
+  relX(evt) {
+    return 2 * (evt.pageX - this.window_offset[0]) / this.window_size[0] - 1;
+  }
+
+  relY(evt) {
+    return 1 - 2 * (evt.pageY - this.window_offset[1]) / this.window_size[1];
+  }
+
+  hud(text, type) {
+    if (typeof document === 'undefined') return;  // for testing on node
+    const el = this.hud_el;
+    if (el) {
+      if (text != null) {
+        if (type === 'HTML') {
+          el.innerHTML = text;
+        } else {
+          el.textContent = text;
+        }
+      } else {
+        el.innerHTML = this.initial_hud_html;
+      }
+      const err = (type === 'ERR');
+      el.style.backgroundColor = (err ? '#b00' : '');
+      if (err && text) console.log('ERR: ' + text);
+    } else {
+      console.log('hud:', text);
+    }
+  }
+
+  redraw_center(force) {
+    const size = this.config.center_cube_size;
+    if (force ||
+        this.target.distanceToSquared(this.last_ctr) > 0.01 * size * size) {
+      this.last_ctr.copy(this.target);
+      if (this.decor.mark) {
+        this.scene.remove(this.decor.mark);
+      }
+      this.decor.mark = makeCube(size, this.target, {
+        color: this.config.colors.center,
+        linewidth: 2,
+      });
+      this.scene.add(this.decor.mark);
+    }
+  }
+
+  redraw_maps(force) {
+    this.redraw_center(force);
+    const r = this.config.map_radius;
+    for (const map_bag of this.map_bags) {
+      if (force || this.target.distanceToSquared(map_bag.block_ctr) > r/100) {
+        this.redraw_map(map_bag);
+      }
+    }
+  }
+
+  remove_and_dispose(obj) {
+    this.scene.remove(obj);
+    if (obj.geometry) obj.geometry.dispose();
+    if (obj.material) {
+      if (obj.material.uniforms && obj.material.uniforms.map) {
+        obj.material.uniforms.map.value.dispose();
+      }
+      obj.material.dispose();
+    }
+    for (const o of obj.children) {
+      this.remove_and_dispose(o);
+    }
+  }
+
+  clear_el_objects(map_bag) {
+    for (const o of map_bag.el_objects) {
+      this.remove_and_dispose(o);
+    }
+    map_bag.el_objects = [];
+  }
+
+  clear_model_objects(model_bag) {
+    for (const o of model_bag.objects) {
+      this.remove_and_dispose(o);
+    }
+    model_bag.objects = [];
+  }
+
+  has_frag_depth() {
+    return this.renderer && this.renderer.extensions.get('EXT_frag_depth');
+  }
+
+  set_model_objects(model_bag) {
+    model_bag.objects = [];
+    model_bag.atom_array = [];
+    let ligand_balls = null;
+    const ligand_sticks = (model_bag.conf.ligand_style === 'sticks');
+    if (model_bag.conf.ligand_style === 'ball&stick' && this.has_frag_depth()) {
+      ligand_balls = this.config.ball_size;
+    }
+    switch (model_bag.conf.render_style) {
+      case 'lines':
+        if (ligand_balls === null && !ligand_sticks) {
+          model_bag.add_bonds(true, true);
+        } else if (ligand_sticks) {
+          model_bag.add_bonds(true, false);
+          model_bag.add_sticks(false, true, this.config.stick_radius);
+        } else {
+          model_bag.add_bonds(true, false);
+          model_bag.add_bonds(false, true, ligand_balls);
+        }
+        break;
+      case 'sticks':
+        if (!this.has_frag_depth()) {
+          this.hud('Stick rendering is not working in this browser' +
+                   '\ndue to lack of suppport for EXT_frag_depth', 'ERR');
+          return;
+        }
+        model_bag.add_sticks(true, true, this.config.stick_radius);
+        break;
+      case 'ball&stick':
+        if (!this.has_frag_depth()) {
+          this.hud('Ball-and-stick rendering is not working in this browser' +
+                   '\ndue to lack of suppport for EXT_frag_depth', 'ERR');
+          return;
+        }
+        if (ligand_balls === null) {
+          model_bag.add_bonds(true, false, this.config.ball_size);
+          model_bag.add_bonds(false, true);
+        } else {
+          model_bag.add_bonds(true, true, this.config.ball_size);
+        }
+        break;
+      case 'backbone':
+        model_bag.add_trace();
+        if (ligand_sticks) {
+          model_bag.add_sticks(false, true, this.config.stick_radius);
+        } else {
+          model_bag.add_bonds(false, true, ligand_balls);
+        }
+        break;
+      case 'ribbon':
+        model_bag.add_ribbon(8);
+        if (ligand_sticks) {
+          model_bag.add_sticks(false, true, this.config.stick_radius);
+        } else {
+          model_bag.add_bonds(false, true, ligand_balls);
+        }
+        break;
+    }
+    for (const o of model_bag.objects) {
+      this.scene.add(o);
+    }
+  }
+
+  // Add/remove label if `show` is specified, toggle otherwise.
+  toggle_label(pick, show) {
+    if (pick.atom == null) return;
+    const text = pick.atom.short_label();
+    const uid = text; // we assume that the labels inside one model are unique
+    const is_shown = (uid in this.labels);
+    if (show === undefined) show = !is_shown;
+    if (show) {
+      if (is_shown) return;
+      const atom_style = pick.atom.is_ligand ? 'ligand_style' : 'render_style';
+      const balls = pick.bag && pick.bag.conf[atom_style] === 'ball&stick';
+      const label = new Label(text, {
+        pos: pick.atom.xyz,
+        font: this.config.label_font,
+        color: '#' + this.config.colors.fg.getHexString(),
+        win_size: this.window_size,
+        z_shift: balls ? this.config.ball_size + 0.1 : 0.2,
+      });
+      if (pick.bag == null || label.mesh == null) return;
+      this.labels[uid] = { o: label, bag: pick.bag };
+      this.scene.add(label.mesh);
+    } else {
+      if (!is_shown) return;
+      this.remove_and_dispose(this.labels[uid].o.mesh);
+      delete this.labels[uid];
+    }
+  }
+
+  redraw_labels() {
+    for (const uid in this.labels) {
+      const text = uid;
+      this.labels[uid].o.redraw(text, {
+        font: this.config.label_font,
+        color: '#' + this.config.colors.fg.getHexString(),
+      });
+    }
+  }
+
+  toggle_map_visibility(map_bag) {
+    if (typeof map_bag === 'number') {
+      map_bag = this.map_bags[map_bag];
+    }
+    map_bag.visible = !map_bag.visible;
+    this.redraw_map(map_bag);
+    this.request_render();
+  }
+
+  redraw_map(map_bag) {
+    this.clear_el_objects(map_bag);
+    if (map_bag.visible) {
+      map_bag.map.block.clear();
+      this.add_el_objects(map_bag);
+    }
+  }
+
+  toggle_model_visibility(model_bag, visible) {
+    model_bag = model_bag || this.selected.bag;
+    if (model_bag == null) return;
+    model_bag.visible = visible == null ? !model_bag.visible : visible;
+    this.redraw_model(model_bag);
+    this.request_render();
+  }
+
+  redraw_model(model_bag) {
+    this.clear_model_objects(model_bag);
+    if (model_bag.visible) {
+      this.set_model_objects(model_bag);
+    }
+  }
+
+  redraw_models() {
+    for (const model_bag of this.model_bags) {
+      this.redraw_model(model_bag);
+    }
+  }
+
+  add_el_objects(map_bag) {
+    if (!map_bag.visible || this.config.map_radius <= 0) return;
+    if (map_bag.map.block.empty()) {
+      const t = this.target;
+      map_bag.block_ctr.copy(t);
+      map_bag.map.extract_block(this.config.map_radius, [t.x, t.y, t.z]);
+    }
+    for (const mtype of map_bag.types) {
+      const isolevel = (mtype === 'map_neg' ? -1 : 1) * map_bag.isolevel;
+      const iso = map_bag.map.isomesh_in_block(isolevel, this.config.map_style);
+      if (iso == null) continue;
+      const obj = makeChickenWire(iso, {
+        color: this.config.colors[mtype],
+        linewidth: this.config.map_line,
+      });
+      map_bag.el_objects.push(obj);
+      this.scene.add(obj);
+    }
+  }
+
+  change_isolevel_by(map_idx, delta) {
+    if (map_idx >= this.map_bags.length) return;
+    const map_bag = this.map_bags[map_idx];
+    map_bag.isolevel += delta;
+    //TODO: move slow part into update()
+    this.clear_el_objects(map_bag);
+    this.add_el_objects(map_bag);
+    const abs_level = map_bag.map.abs_level(map_bag.isolevel);
+    let abs_text = abs_level.toFixed(4);
+    const tied = this.tied_viewer;
+    if (tied && map_idx < tied.map_bags.length) {
+      const tied_bag = tied.map_bags[map_idx];
+      // Should we tie by sigma or absolute level? Now it's sigma.
+      tied_bag.isolevel = map_bag.isolevel;
+      abs_text += ' / ' + tied_bag.map.abs_level(tied_bag.isolevel).toFixed(4);
+      tied.clear_el_objects(tied_bag);
+      tied.add_el_objects(tied_bag);
+    }
+    this.hud('map ' + (map_idx+1) + ' level =  ' + abs_text + ' ' +
+             map_bag.map.unit + ' (' + map_bag.isolevel.toFixed(2) + ' rmsd)');
+  }
+
+  change_map_radius(delta) {
+    const rmax = this.config.max_map_radius;
+    const cf = this.config;
+    cf.map_radius = Math.min(Math.max(cf.map_radius + delta, 0), rmax);
+    cf.map_radius = Math.round(cf.map_radius * 1e9) / 1e9;
+    let info = 'map "radius": ' + cf.map_radius;
+    if (cf.map_radius === rmax) info += ' (max)';
+    else if (cf.map_radius === 0) info += ' (hidden maps)';
+    if (this.map_bags.length === 0) info += '\nNB: no map is loaded.';
+    this.hud(info);
+    this.redraw_maps(true);
+  }
+
+  change_slab_width_by(delta) {
+    const slab_width = this.controls.slab_width;
+    slab_width[0] = Math.max(slab_width[0] + delta, 0.01);
+    slab_width[1] = Math.max(slab_width[1] + delta, 0.01);
+    this.update_camera();
+    const final_width = this.camera.far - this.camera.near;
+    this.hud('clip width: ' + final_width.toPrecision(3));
+  }
+
+  change_zoom_by_factor(mult) {
+    this.camera.zoom *= mult;
+    this.update_camera();
+    this.hud('zoom: ' + this.camera.zoom.toPrecision(3));
+  }
+
+  change_bond_line(delta) {
+    this.config.bond_line = Math.max(this.config.bond_line + delta, 0.1);
+    this.redraw_models();
+    this.hud('bond width: ' + scale_by_height(this.config.bond_line,
+                                              this.window_size).toFixed(1));
+  }
+
+  change_stick_radius(delta) {
+    this.config.stick_radius = Math.max(this.config.stick_radius + delta, 0.01);
+    this.config.stick_radius =
+      Math.round(this.config.stick_radius * 1000) / 1000;
+    this.redraw_models();
+    this.hud('stick radius: ' + this.config.stick_radius.toFixed(3));
+  }
+
+  change_map_line(delta) {
+    this.config.map_line = Math.max(this.config.map_line + delta, 0.1);
+    this.redraw_maps(true);
+    this.hud('wireframe width: ' + this.config.map_line.toFixed(1));
+  }
+
+  toggle_full_screen() {
+    const d = document;
+    // @ts-expect-error no mozFullScreenElement
+    if (d.fullscreenElement || d.mozFullScreenElement ||
+        // @ts-expect-error no msFullscreenElement
+        d.webkitFullscreenElement || d.msFullscreenElement) {
+      // @ts-expect-error no webkitExitFullscreen
+      const ex = d.exitFullscreen || d.webkitExitFullscreen ||
+                 // @ts-expect-error no msExitFullscreen
+                 d.mozCancelFullScreen || d.msExitFullscreen;
+      if (ex) ex.call(d);
+    } else {
+      const el = this.container;
+      if (!el) return;
+      // @ts-expect-error no webkitRequestFullscreen
+      const req = el.requestFullscreen || el.webkitRequestFullscreen ||
+                  // @ts-expect-error no msRequestFullscreen
+                  el.mozRequestFullScreen || el.msRequestFullscreen;
+      if (req) req.call(el);
+    }
+  }
+
+  toggle_cell_box() {
+    if (this.decor.cell_box) {
+      this.scene.remove(this.decor.cell_box);
+      this.decor.cell_box = null;
+    } else {
+      const uc_func = this.get_cell_box_func();
+      if (uc_func) {
+        this.decor.cell_box = makeRgbBox(uc_func, this.config.colors.fg);
+        this.scene.add(this.decor.cell_box);
+      }
+    }
+  }
+
+  get_cell_box_func() {
+    let uc = null;
+    if (this.selected.bag != null) {
+      uc = this.selected.bag.model.unit_cell;
+    }
+    // note: model may not have unit cell
+    if (uc == null && this.map_bags.length > 0) {
+      uc = this.map_bags[0].map.unit_cell;
+    }
+    return uc && uc.orthogonalize.bind(uc);
+  }
+
+  shift_clip(delta) {
+    const eye = this.camera.position.clone().sub(this.target);
+    eye.multiplyScalar(delta / eye.length());
+    this.target.add(eye);
+    this.camera.position.add(eye);
+    this.update_camera();
+    this.redraw_maps();
+    this.hud('clip shifted by [' + vec3_to_fixed(eye, 2).join(' ') + ']');
+  }
+
+  go_to_nearest_Ca() {
+    const t = this.target;
+    const bag = this.selected.bag;
+    if (bag == null) return;
+    const atom = bag.model.get_nearest_atom(t.x, t.y, t.z, 'CA');
+    if (atom != null) {
+      this.select_atom({bag, atom}, {steps: 30});
+    } else {
+      this.hud('no nearby CA');
+    }
+  }
+
+  toggle_inactive_models() {
+    const n = this.model_bags.length;
+    if (n < 2) {
+      this.hud((n == 0 ? 'No' : 'Only one') + ' model is loaded. ' +
+               '"V" is for working with multiple models.');
+      return;
+    }
+    const show_all = !this.model_bags.every(function (m) { return m.visible; });
+    for (const model_bag of this.model_bags) {
+      const show = show_all || model_bag === this.selected.bag;
+      this.toggle_model_visibility(model_bag, show);
+    }
+    this.hud(show_all ? 'All models visible' : 'Inactive models hidden');
+  }
+
+  permalink() {
+    if (typeof window === 'undefined') return;
+    const xyz_prec = Math.round(-Math.log10(0.001));
+    window.location.hash =
+      '#xyz=' + vec3_to_fixed(this.target, xyz_prec).join(',') +
+      '&eye=' + vec3_to_fixed(this.camera.position, 1).join(',') +
+      '&zoom=' + this.camera.zoom.toFixed(0);
+    this.hud('copy URL from the location bar');
+  }
+
+  create_cid_dialog() {
+    if (typeof document === 'undefined' || this.container == null) return;
+    const dialog = document.createElement('div');
+    dialog.style.display = 'none';
+    dialog.style.position = 'absolute';
+    dialog.style.left = '50%';
+    dialog.style.top = '20px';
+    dialog.style.transform = 'translateX(-50%)';
+    dialog.style.padding = '8px 10px';
+    dialog.style.borderRadius = '6px';
+    dialog.style.backgroundColor = 'rgba(0, 0, 0, 0.85)';
+    dialog.style.color = '#ddd';
+    dialog.style.zIndex = '20';
+    dialog.style.boxShadow = '0 2px 12px rgba(0,0,0,0.35)';
+
+    const label = document.createElement('div');
+    label.textContent = 'Go to atom/residue (Gemmi CID)';
+    label.style.fontSize = '13px';
+    label.style.marginBottom = '6px';
+    dialog.appendChild(label);
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = 'e.g. /*/A/15/CA';
+    input.style.width = '220px';
+    input.style.padding = '4px 6px';
+    input.style.border = '1px solid #666';
+    input.style.borderRadius = '4px';
+    input.style.backgroundColor = '#111';
+    input.style.color = '#eee';
+    input.style.outline = 'none';
+    input.addEventListener('keydown', (evt) => {
+      evt.stopPropagation();
+      if (evt.key === 'Escape') {
+        evt.preventDefault();
+        this.close_cid_dialog();
+      } else if (evt.key === 'Enter') {
+        evt.preventDefault();
+        this.apply_cid_input();
+      }
+    });
+    dialog.appendChild(input);
+
+    this.container.appendChild(dialog);
+    this.cid_dialog_el = dialog;
+    this.cid_input_el = input;
+  }
+
+  open_cid_dialog() {
+    if (this.cid_dialog_el == null || this.cid_input_el == null) return;
+    if (this.selected.bag == null || this.selected.bag.gemmi_selection == null) {
+      this.hud('Gemmi selection is unavailable for this model.', 'ERR');
+      return;
+    }
+    this.cid_dialog_el.style.display = 'block';
+    this.cid_input_el.focus();
+    this.cid_input_el.select();
+  }
+
+  close_cid_dialog() {
+    if (this.cid_dialog_el == null || this.cid_input_el == null) return;
+    this.cid_dialog_el.style.display = 'none';
+    this.cid_input_el.blur();
+    if (this.renderer && this.renderer.domElement) this.renderer.domElement.focus();
+  }
+
+  apply_cid_input() {
+    if (this.cid_input_el == null) return;
+    const cid = this.cid_input_el.value.trim();
+    if (cid === '') {
+      this.close_cid_dialog();
+      return;
+    }
+    try {
+      const sel = this.selection_atoms(cid);
+      if (sel.atoms.length === 0) {
+        this.hud('No atoms match selection: ' + cid);
+        return;
+      }
+      if (sel.atoms.length === 1) {
+        this.select_atom({bag: sel.bag, atom: sel.atoms[0]}, {steps: 30});
+      } else {
+        this.center_on_selection(cid, {bag: sel.bag, steps: 30});
+      }
+      this.close_cid_dialog();
+    } catch (e) {
+      this.hud(e.message, 'ERR');
+    }
+  }
+
+  redraw_all() {
+    if (!this.renderer) return;
+    this.scene.fog.color = this.config.colors.bg;
+    if (this.renderer) this.renderer.setClearColor(this.config.colors.bg, 1);
+    this.redraw_models();
+    this.redraw_maps(true);
+    this.redraw_labels();
+  }
+
+  toggle_help() {
+    const el = this.help_el;
+    if (!el) return;
+    el.style.display = el.style.display === 'block' ? 'none' : 'block';
+    if (el.style.display === 'block') {
+      this.update_help();
+    }
+  }
+
+  update_help() {
+    const el = this.help_el;
+    if (!el) return;
+    el.innerHTML = [this.MOUSE_HELP, this.KEYBOARD_HELP,
+                    this.ABOUT_HELP, this.fps_text].join('\n\n');
+  }
+
+  update_fps() {
+    const now = performance.now();
+    if (this.last_frame_time !== 0) {
+      this.frame_times.push(now - this.last_frame_time);
+      if (this.frame_times.length > 30) this.frame_times.shift();
+      let sum = 0;
+      for (const dt of this.frame_times) sum += dt;
+      if (sum > 0) {
+        const fps = 1000 * this.frame_times.length / sum;
+        this.fps_text = 'FPS: ' + fps.toFixed(1);
+      }
+    }
+    this.last_frame_time = now;
+    if (this.help_el && this.help_el.style.display === 'block') {
+      this.update_help();
+    }
+  }
+
+  select_next(info, key, options, back) {
+    const old_idx = options.indexOf(this.config[key]);
+    const len = options.length;
+    const new_idx = (old_idx + (back ? len - 1 : 1)) % len;
+    this.config[key] = options[new_idx];
+    let html = info + ':';
+    for (let i = 0; i < len; i++) {
+      const tag = (i === new_idx ? 'u' : 's');
+      html += ' <' + tag + '>' + options[i] + '</' + tag + '>';
+    }
+    this.hud(html, 'HTML');
+  }
+
+  keydown(evt) {
+    if (evt.ctrlKey) {
+      if (evt.keyCode === 71) { // Ctrl-G
+        evt.preventDefault();
+        this.open_cid_dialog();
+        return;
+      }
+      return;
+    }
+    const action = this.key_bindings[evt.keyCode];
+    if (action) {
+      (action.bind(this))(evt);
+    } else {
+      if (action === false) evt.preventDefault();
+      if (this.help_el) this.hud('Nothing here. Press H for help.');
+    }
+    this.request_render();
+  }
+
+  set_common_key_bindings() {
+    const kb = new Array(256);
+    // b
+    kb[66] = function ( evt) {
+      const schemes = Object.keys(this.ColorSchemes);
+      this.select_next('color scheme', 'color_scheme', schemes, evt.shiftKey);
+      this.set_colors();
+    };
+    // c
+    kb[67] = function ( evt) {
+      this.select_next('coloring by', 'color_prop', COLOR_PROPS, evt.shiftKey);
+      this.redraw_models();
+    };
+    // e
+    kb[69] = function () {
+      const fog = this.scene.fog;
+      const has_fog = (fog.far === 1);
+      fog.far = (has_fog ? 1e9 : 1);
+      this.hud((has_fog ? 'dis': 'en') + 'able fog');
+      this.redraw_all();
+    };
+    // h
+    kb[72] = this.toggle_help;
+    // i
+    kb[73] = function ( evt) {
+      this.hud('toggled spinning');
+      this.controls.toggle_auto(evt.shiftKey);
+    };
+    // k
+    kb[75] = function () {
+      this.hud('toggled rocking');
+      this.controls.toggle_auto(0.0);
+    };
+    // m
+    kb[77] = function ( evt) {
+      this.change_zoom_by_factor(evt.shiftKey ? 1.2 : 1.03);
+    };
+    // n
+    kb[78] = function ( evt) {
+      this.change_zoom_by_factor(1 / (evt.shiftKey ? 1.2 : 1.03));
+    };
+    // q
+    kb[81] = function ( evt) {
+      this.select_next('label font', 'label_font', LABEL_FONTS, evt.shiftKey);
+      this.redraw_labels();
+    };
+    // r
+    kb[82] = function ( evt) {
+      if (evt.shiftKey) {
+        this.hud('redraw!');
+        this.redraw_all();
+      } else {
+        this.hud('recentered');
+        this.recenter();
+      }
+    };
+    // w
+    kb[87] = function ( evt) {
+      this.select_next('map style', 'map_style', MAP_STYLES, evt.shiftKey);
+      this.redraw_maps(true);
+    };
+    // add, equals/firefox, equal sign
+    kb[107] = kb[61] = kb[187] = function ( evt) {
+      this.change_isolevel_by(evt.shiftKey ? 1 : 0, 0.1);
+    };
+    // subtract, minus/firefox, dash
+    kb[109] = kb[173] = kb[189] = function ( evt) {
+      this.change_isolevel_by(evt.shiftKey ? 1 : 0, -0.1);
+    };
+    // [
+    kb[219] = function () { this.change_map_radius(-2); };
+    // ]
+    kb[221] = function () { this.change_map_radius(2); };
+    // shift, ctrl, alt, altgr
+    kb[16] = kb[17] = kb[18] = kb[225] = function () {};
+    // slash, single quote
+    kb[191] = kb[222] = false;  // -> preventDefault()
+
+    this.key_bindings = kb;
+  }
+
+  set_real_space_key_bindings() {
+    const kb = this.key_bindings;
+    // Home
+    kb[36] = function ( evt) {
+      if (evt.shiftKey) {
+        this.change_map_line(0.1);
+      } else {
+        this.change_stick_radius(0.01);
+      }
+    };
+    // End
+    kb[35] = function ( evt) {
+      if (evt.shiftKey) {
+        this.change_map_line(-0.1);
+      } else {
+        this.change_stick_radius(-0.01);
+      }
+    };
+    // Space
+    kb[32] = function ( evt) {
+      this.center_next_residue(evt.shiftKey);
+    };
+    // d
+    kb[68] = function () {
+      this.change_slab_width_by(-0.1);
+    };
+    // f
+    kb[70] = function ( evt) {
+      if (evt.shiftKey) {
+        this.toggle_full_screen();
+      } else {
+        this.change_slab_width_by(0.1);
+      }
+    };
+    // l
+    kb[76] = function ( evt) {
+      this.select_next('ligands as', 'ligand_style', LIGAND_STYLES, evt.shiftKey);
+      this.redraw_models();
+    };
+    // p
+    kb[80] = function ( evt) {
+      if (evt.shiftKey) {
+        this.permalink();
+      } else {
+        this.go_to_nearest_Ca();
+      }
+    };
+    // s
+    kb[83] = function ( evt) {
+      this.select_next('rendering as', 'render_style', RENDER_STYLES, evt.shiftKey);
+      this.redraw_models();
+    };
+    // t
+    kb[84] = function ( evt) {
+      this.select_next('waters as', 'water_style', WATER_STYLES, evt.shiftKey);
+      this.redraw_models();
+    };
+    // u
+    kb[85] = function () {
+      this.hud('toggled unit cell box');
+      this.toggle_cell_box();
+    };
+    // v
+    kb[86] = function () {
+      this.toggle_inactive_models();
+    };
+    // y
+    kb[89] = function () {
+      this.config.hydrogens = !this.config.hydrogens;
+      this.hud((this.config.hydrogens ? 'show' : 'hide') +
+               ' hydrogens (if any)');
+      this.redraw_models();
+    };
+    // comma
+    kb[188] = function ( evt) {
+      if (evt.shiftKey) this.shift_clip(1);
+    };
+    // period
+    kb[190] = function ( evt) {
+      if (evt.shiftKey) this.shift_clip(-1);
+    };
+  }
+
+  mousedown(event) {
+    //event.preventDefault(); // default involves setting focus, which we need
+    event.stopPropagation();
+    document.addEventListener('mouseup', this.mouseup);
+    document.addEventListener('mousemove', this.mousemove);
+    let state = STATE.NONE;
+    if (event.button === 1 || (event.button === 0 && event.ctrlKey)) {
+      state = STATE.PAN;
+    } else if (event.button === 0) {
+      // in Coot shift+Left is labeling atoms like dblclick, + rotation
+      if (event.shiftKey) {
+        this.dblclick(event);
+      }
+      state = STATE.ROTATE;
+    } else if (event.button === 2) {
+      if (event.ctrlKey) {
+        state = event.shiftKey ? STATE.ROLL : STATE.SLAB;
+      } else {
+        this.decor.zoom_grid.visible = true;
+        state = STATE.ZOOM;
+      }
+    }
+    this.controls.start(state, this.relX(event), this.relY(event));
+    this.request_render();
+  }
+
+  dblclick(event) {
+    if (event.button !== 0) return;
+    if (this.decor.selection) {
+      this.remove_and_dispose(this.decor.selection);
+      this.decor.selection = null;
+    }
+    const mouse = [this.relX(event), this.relY(event)];
+    const pick = this.pick_atom(mouse, this.camera);
+    if (pick) {
+      const atom = pick.atom;
+      this.hud(pick.bag.label + ' ' + atom.long_label());
+      this.dbl_click_callback(pick);
+      const color = this.config.colors[atom.element] || this.config.colors.def;
+      const size = 2.5 * scale_by_height(this.config.bond_line,
+                                         this.window_size);
+      this.decor.selection = makeWheels([atom], [color], size);
+      this.scene.add(this.decor.selection);
+    } else {
+      this.hud();
+    }
+    this.request_render();
+  }
+
+  touchstart(event) {
+    const touches = event.touches;
+    if (touches.length === 1) {
+      this.controls.start(STATE.ROTATE,
+                          this.relX(touches[0]), this.relY(touches[0]));
+    } else { // for now using only two touches
+      const info = touch_info(event);
+      this.controls.start(STATE.PAN_ZOOM,
+                          this.relX(info), this.relY(info), info.dist);
+    }
+    this.request_render();
+  }
+
+  touchmove(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    const touches = event.touches;
+    if (touches.length === 1) {
+      this.controls.move(this.relX(touches[0]), this.relY(touches[0]));
+    } else { // for now using only two touches
+      const info = touch_info(event);
+      this.controls.move(this.relX(info), this.relY(info), info.dist);
+    }
+  }
+
+  touchend(/*event*/) {
+    this.controls.stop();
+    this.redraw_maps();
+  }
+
+  wheel(evt) {
+    evt.preventDefault();
+    evt.stopPropagation();
+    this.mousewheel_action(evt.deltaY, evt);
+    this.request_render();
+  }
+
+  // overrided in ReciprocalViewer
+  mousewheel_action(delta, evt) {
+    const map_idx = evt.shiftKey ? 1 : 0;
+    this.change_isolevel_by(map_idx, 0.0005 * delta);
+  }
+
+  resize(/*evt*/) {
+    const el = this.container;
+    if (el == null) return;
+    const width = el.clientWidth;
+    const height = el.clientHeight;
+    this.window_offset[0] = el.offsetLeft;
+    this.window_offset[1] = el.offsetTop;
+    this.camera.left = -width;
+    this.camera.right = width;
+    this.camera.top = height;
+    this.camera.bottom = -height;
+    this.camera.updateProjectionMatrix();
+    this.renderer.setSize(width, height);
+    if (width !== this.window_size[0] || height !== this.window_size[1]) {
+      this.window_size[0] = width;
+      this.window_size[1] = height;
+      this.redraw_models(); // b/c bond_line is scaled by height
+    }
+    this.request_render();
+  }
+
+  // If xyz set recenter on it looking toward the model center.
+  // Otherwise recenter on the model center looking along the z axis.
+  recenter(xyz, cam, steps) {
+    const bag = this.selected.bag;
+    const new_up = new Vector3(0, 1, 0);
+    let vec_cam;
+    let vec_xyz;
+    let eye;
+    if (xyz != null && cam == null && bag != null) {
+      // look from specified point toward the center of the molecule,
+      // i.e. shift camera away from the molecule center.
+      const mc = bag.model.get_center();
+      eye = new Vector3(xyz[0] - mc[0], xyz[1] - mc[1], xyz[2] - mc[2]);
+      eye.setLength(100);
+      vec_xyz = new Vector3(xyz[0], xyz[1], xyz[2]);
+      vec_cam = eye.clone().add(vec_xyz);
+    } else {
+      if (xyz == null) {
+        if (bag != null) {
+          xyz = bag.model.get_center();
+        } else {
+          const uc_func = this.get_cell_box_func();
+          xyz = uc_func ? uc_func([0.5, 0.5, 0.5]) : [0, 0, 0];
+        }
+      }
+      vec_xyz = new Vector3(xyz[0], xyz[1], xyz[2]);
+      if (cam != null) {
+        vec_cam = new Vector3(cam[0], cam[1], cam[2]);
+        eye = vec_cam.clone().sub(vec_xyz);
+        new_up.copy(this.camera.up); // preserve the up direction
+      } else {
+        const dc = this.default_camera_pos;
+        vec_cam = new Vector3(xyz[0] + dc[0], xyz[1] + dc[1], xyz[2] + dc[2]);
+      }
+    }
+    if (eye != null) {
+      new_up.projectOnPlane(eye);
+      if (new_up.lengthSq() < 0.0001) new_up.x += 1;
+      new_up.normalize();
+    }
+    this.controls.go_to(vec_xyz, vec_cam, new_up, steps);
+  }
+
+  center_next_residue(back) {
+    const bag = this.selected.bag;
+    if (bag == null) return;
+    const atom = bag.model.next_residue(this.selected.atom, back);
+    if (atom != null) {
+      this.select_atom({bag, atom}, {steps: 30});
+    }
+  }
+
+  select_atom(pick, options={}) {
+    this.hud('-> ' + pick.bag.label + ' ' + pick.atom.long_label());
+    const xyz = pick.atom.xyz;
+    this.controls.go_to(new Vector3(xyz[0], xyz[1], xyz[2]),
+                        null, null, options.steps);
+    this.toggle_label(this.selected, false);
+    this.selected = pick;
+    this.toggle_label(this.selected, true);
+  }
+
+  selection_atom_indices(cid, model_bag) {
+    const bag = model_bag || this.selected.bag || this.model_bags[0];
+    if (bag == null) throw Error('No model is loaded.');
+    if (bag.gemmi_selection == null) {
+      throw Error('Gemmi selection is unavailable for this model.');
+    }
+    const ctx = bag.gemmi_selection;
+    const result = new ctx.gemmi.SelectionResult();
+    try {
+      result.set_atom_indices(ctx.structure, cid, ctx.model_index);
+      const ptr = result.atom_data_ptr();
+      const len = result.atom_data_size();
+      return new Int32Array(ctx.gemmi.HEAPU8.buffer, ptr, len).slice();
+    } finally {
+      result.delete();
+    }
+  }
+
+  selection_atoms(cid, model_bag) {
+    const bag = model_bag || this.selected.bag || this.model_bags[0];
+    if (bag == null) throw Error('No model is loaded.');
+    const indices = this.selection_atom_indices(cid, bag);
+    const atoms = [];
+    for (let i = 0; i < indices.length; ++i) {
+      const idx = indices[i];
+      if (idx >= 0 && idx < bag.model.atoms.length) atoms.push(bag.model.atoms[idx]);
+    }
+    return { bag: bag, atoms: atoms, indices: indices };
+  }
+
+  center_on_selection(cid, options={}) {
+    const sel = this.selection_atoms(cid, options.bag);
+    if (sel.atoms.length === 0) {
+      this.hud('No atoms match selection: ' + cid);
+      return;
+    }
+    let x = 0, y = 0, z = 0;
+    for (const atom of sel.atoms) {
+      x += atom.xyz[0];
+      y += atom.xyz[1];
+      z += atom.xyz[2];
+    }
+    const n = sel.atoms.length;
+    this.hud('selection ' + cid + ': ' + n + ' atoms');
+    this.controls.go_to(new Vector3(x / n, y / n, z / n),
+                        null, null, options.steps);
+    this.request_render();
+  }
+
+  select_by_cid(cid, options={}) {
+    const sel = this.selection_atoms(cid, options.bag);
+    if (sel.atoms.length === 0) {
+      this.hud('No atoms match selection: ' + cid);
+      return;
+    }
+    this.select_atom({bag: sel.bag, atom: sel.atoms[0]}, {steps: options.steps});
+    this.request_render();
+  }
+
+  update_camera() {
+    const dxyz = this.camera.position.distanceTo(this.target);
+    const w = this.controls.slab_width;
+    const scale = w[2] || this.camera.zoom;
+    this.camera.near = dxyz * (1 - w[0] / scale);
+    this.camera.far = dxyz * (1 + w[1] / scale);
+    this.camera.updateProjectionMatrix();
+  }
+
+  // The main loop. Running when a mouse button is pressed or when the view
+  // is moving (and run once more after the mouse button is released).
+  // It is also triggered by keydown events.
+  render() {
+    this.scheduled = true;
+    if (this.renderer === null) return;
+    this.update_fps();
+    if (this.controls.update()) {
+      this.update_camera();
+    }
+    const tied = this.tied_viewer;
+    if (!this.controls.is_going()) {
+      this.redraw_maps();
+      if (tied && !tied.scheduled) tied.redraw_maps();
+    }
+    this.renderer.render(this.scene, this.camera);
+    if (tied && !tied.scheduled) tied.renderer.render(tied.scene, tied.camera);
+    //if (this.nav) {
+    //  this.nav.renderer.render(this.nav.scene, this.camera);
+    //}
+    this.scheduled = false;
+    if (this.controls.is_moving()) {
+      this.request_render();
+    }
+  }
+
+  request_render() {
+    if (typeof window !== 'undefined' && !this.scheduled) {
+      this.scheduled = true;
+      window.requestAnimationFrame(this.render.bind(this));
+    }
+  }
+
+  add_model(model, options={}) {
+    const model_bag = new ModelBag(model, this.config, this.window_size);
+    model_bag.hue_shift = options.hue_shift || 0.06 * this.model_bags.length;
+    model_bag.gemmi_selection = options.gemmi_selection || null;
+    this.model_bags.push(model_bag);
+    this.set_model_objects(model_bag);
+    this.request_render();
+  }
+
+  add_map(map, is_diff_map) {
+    //map.show_debug_info();
+    const map_bag = new MapBag(map, this.config, is_diff_map);
+    this.map_bags.push(map_bag);
+    this.add_el_objects(map_bag);
+    this.request_render();
+  }
+
+  load_file(url, options,
+            callback ) {
+    if (this.renderer === null) return;  // no WebGL detected
+    const req = new XMLHttpRequest();
+    req.open('GET', url, true);
+    if (options.binary) {
+      req.responseType = 'arraybuffer';
+    } else {
+      // http://stackoverflow.com/questions/7374911/
+      req.overrideMimeType('text/plain');
+    }
+    const self = this;
+    Object.keys(this.xhr_headers).forEach(function (name) {
+      req.setRequestHeader(name, self.xhr_headers[name]);
+    });
+    req.onreadystatechange = function () {
+      if (req.readyState === 4) {
+        // chrome --allow-file-access-from-files gives status 0
+        if (req.status === 200 || (req.status === 0 && req.response !== null &&
+                                                       req.response !== '')) {
+          try {
+            callback(req);
+          } catch (e) {
+            self.hud('Error: ' + e.message + '\nwhen processing ' + url, 'ERR');
+          }
+        } else {
+          self.hud('Failed to fetch ' + url, 'ERR');
+        }
+      }
+    };
+    if (options.progress) {
+      req.addEventListener('progress', function (evt) {
+        if (evt.lengthComputable && evt.loaded && evt.total) {
+          const fn = url.split('/').pop();
+          self.hud('loading ' + fn + ' ... ' + ((evt.loaded / 1024) | 0) +
+                   ' / ' + ((evt.total / 1024) | 0) + ' kB');
+          if (evt.loaded === evt.total) self.hud(); // clear progress message
+        }
+      });
+    }
+    try {
+      req.send(null);
+    } catch (e) {
+      self.hud('loading ' + url + ' failed:\n' + e, 'ERR');
+    }
+  }
+
+  set_dropzone(zone, callback) {
+    const self = this;
+    zone.addEventListener('dragstart', function (e) {
+      e.preventDefault();
+    });
+    zone.addEventListener('dragover', function (e) {
+      e.stopPropagation();
+      e.preventDefault();
+      if (e.dataTransfer != null) e.dataTransfer.dropEffect = 'copy';
+      self.hud('ready for file drop...');
+    });
+    zone.addEventListener('drop', function (e) {
+      e.stopPropagation();
+      e.preventDefault();
+      if (e.dataTransfer == null) return;
+      const names = [];
+      for (let i = 0; i < e.dataTransfer.files.length; i++) {
+        const file = e.dataTransfer.files.item(i);
+        try {
+          self.hud('Loading ' + file.name);
+          callback(file);
+        } catch (e) {
+          self.hud('Loading ' + file.name + ' failed.\n' + e.message, 'ERR');
+          return;
+        }
+        names.push(file.name);
+      }
+      self.hud('loaded ' + names.join(', '));
+    });
+  }
+
+  // for use with set_dropzone
+  pick_pdb_and_map(file) {
+    const self = this;
+    const reader = new FileReader();
+    if (/\.(pdb|ent|cif|mmcif|mcif|mmjson)$/i.test(file.name)) {
+      reader.onloadend = function (evt) {
+        if (evt.target == null || evt.target.readyState != 2) return;
+        self.load_coordinate_buffer(evt.target.result , file.name).then(function () {
+          self.recenter();
+        }, function (e) {
+          self.hud('Loading ' + file.name + ' failed.\n' + e.message, 'ERR');
+        });
+      };
+      reader.readAsArrayBuffer(file);
+    } else if (/\.(map|ccp4|mrc|dsn6|omap)$/.test(file.name)) {
+      const map_format = /\.(dsn6|omap)$/.test(file.name) ? 'dsn6' : 'ccp4';
+      reader.onloadend = function (evt) {
+        if (evt.target == null || evt.target.readyState != 2) return;
+        const after_load = (map_format === 'ccp4') ?
+          self.resolve_gemmi().then(function (gemmi) {
+            if (gemmi == null) throw Error('Gemmi is required for CCP4 map loading.');
+            self.load_map_from_buffer(evt.target.result ,
+                                      {format: map_format}, gemmi);
+          }) :
+          Promise.resolve().then(function () {
+            self.load_map_from_buffer(evt.target.result ,
+                                      {format: map_format});
+          });
+        after_load.then(function () {
+          if (self.model_bags.length === 0 && self.map_bags.length === 1) {
+            self.recenter();
+          }
+        }, function (e) {
+          self.hud('Loading ' + file.name + ' failed.\n' + e.message, 'ERR');
+        });
+      };
+      reader.readAsArrayBuffer(file);
+    } else {
+      throw Error('Unknown file extension. ' +
+                  'Use: pdb, ent, cif, mmcif, mcif, mmjson, ccp4, mrc, map, dsn6 or omap.');
+    }
+  }
+
+  set_view(options) {
+    const frag = parse_url_fragment();
+    if (frag.zoom) this.camera.zoom = frag.zoom;
+    this.recenter(frag.xyz || (options && options.center), frag.eye, 1);
+  }
+
+  fetch_monomer_cif(resname) {
+    const name = resname.toUpperCase();
+    if (!(name in this.monomer_cif_cache)) {
+      this.monomer_cif_cache[name] = fetch(
+        'https://files.rcsb.org/ligands/view/' + encodeURIComponent(name) + '.cif'
+      ).then(function (resp) {
+        return resp.ok ? resp.text() : null;
+      }).catch(function () {
+        return null;
+      });
+    }
+    return this.monomer_cif_cache[name];
+  }
+
+  fetch_monomer_cifs(resnames) {
+    const unique = Array.from(new Set(resnames.filter(Boolean))).sort();
+    return Promise.all(unique.map(this.fetch_monomer_cif, this)).then(function (cif_texts) {
+      return cif_texts.filter(function (v) { return v != null; });
+    });
+  }
+
+  resolve_gemmi(explicit_module) {
+    if (explicit_module) return Promise.resolve(explicit_module);
+    if (this.gemmi_module) return Promise.resolve(this.gemmi_module);
+    if (this.gemmi_factory == null) return Promise.resolve(null);
+    if (this.gemmi_loading == null) {
+      const self = this;
+      this.gemmi_loading = this.gemmi_factory().then(function (gemmi) {
+        self.gemmi_module = gemmi;
+        return gemmi;
+      }, function (err) {
+        self.gemmi_loading = null;
+        throw err;
+      });
+    }
+    return this.gemmi_loading;
+  }
+
+  load_coordinate_buffer(buffer, name, explicit_gemmi) {
+    const self = this;
+    return this.resolve_gemmi(explicit_gemmi).then(function (gemmi) {
+      if (!gemmi) throw Error('Gemmi is required for coordinate loading.');
+      return self.load_structure_from_buffer(gemmi, buffer, name);
+    });
+  }
+
+  // Load molecular model from PDB file and centers the view
+  load_pdb_from_text(text, name='model.pdb', explicit_gemmi) {
+    const self = this;
+    return this.resolve_gemmi(explicit_gemmi).then(function (gemmi) {
+      if (!gemmi) throw Error('Gemmi is required for coordinate loading.');
+      const buffer = new TextEncoder().encode(text).buffer;
+      return self.load_structure_from_buffer(gemmi, buffer, name);
+    });
+  }
+
+  load_structure_from_buffer(gemmi, buffer, name) {
+    const len = this.model_bags.length;
+    const self = this;
+    return modelsFromGemmi(gemmi, buffer, name,
+                           this.fetch_monomer_cifs.bind(this)).then(function (result) {
+      for (const model of result.models) {
+        self.add_model(model, {
+          gemmi_selection: {
+            gemmi: gemmi,
+            structure: result.structure,
+            model_index: model.source_model_index == null ? 0 : model.source_model_index,
+          },
+        });
+      }
+      self.selected.bag = self.model_bags[len];
+      self.last_bonding_info = result.bonding;
+    });
+  }
+
+  load_pdb(url, options,
+           callback) {
+    const self = this;
+    const gemmi = options && options.gemmi;
+    this.load_file(url, {binary: true, progress: true}, function (req) {
+      const t0 = performance.now();
+      self.load_coordinate_buffer(req.response, url, gemmi).then(function () {
+        console.log('coordinate file processed in', (performance.now() - t0).toFixed(2),
+                    (gemmi || self.gemmi_module) ? 'ms (using gemmi)': 'ms');
+        if (options == null || !options.stay) self.set_view(options);
+        if (callback) callback();
+      }, function (e) {
+        self.hud('Error: ' + e.message + '\nwhen processing ' + url, 'ERR');
+      });
+    });
+  }
+
+  load_map(url, options,
+           callback) {
+    if (url == null) {
+      if (callback) callback();
+      return;
+    }
+    if (options.format !== 'ccp4' && options.format !== 'dsn6') {
+      throw Error('Unknown map format.');
+    }
+    const self = this;
+    this.load_file(url, {binary: true, progress: true}, function (req) {
+      const after_load = (options.format === 'ccp4') ?
+        self.resolve_gemmi().then(function (gemmi) {
+          if (gemmi == null) throw Error('Gemmi is required for CCP4 map loading.');
+          self.load_map_from_buffer(req.response, options, gemmi);
+        }) :
+        Promise.resolve().then(function () {
+          self.load_map_from_buffer(req.response, options);
+        });
+      after_load.then(function () {
+        if (callback) callback();
+      }, function (e) {
+        self.hud('Error: ' + e.message + '\nwhen processing ' + url, 'ERR');
+      });
+    });
+  }
+
+  load_map_from_buffer(buffer, options, gemmi) {
+    const map = new ElMap();
+    if (options.format === 'dsn6') {
+      map.from_dsn6(buffer);
+    } else {
+      map.from_ccp4(buffer, true, gemmi);
+    }
+    this.add_map(map, options.diff_map);
+  }
+
+  // Load a normal map and a difference map.
+  // To show the first map ASAP we do not download both maps in parallel.
+  load_maps(url1, url2,
+            options, callback) {
+    const format = options.format || 'ccp4';
+    const self = this;
+    this.load_map(url1, {diff_map: false, format: format}, function () {
+      self.load_map(url2, {diff_map: true, format: format}, callback);
+    });
+  }
+
+  // Load a model (PDB), normal map and a difference map - in this order.
+  load_pdb_and_maps(pdb, map1, map2,
+                    options, callback) {
+    const self = this;
+    this.load_pdb(pdb, options, function () {
+      self.load_maps(map1, map2, options, callback);
+    });
+  }
+
+  // for backward compatibility:
+  load_ccp4_maps(url1, url2, callback) {
+    this.load_maps(url1, url2, {format: 'ccp4'}, callback);
+  }
+  load_pdb_and_ccp4_maps(pdb, map1, map2,
+                         callback) {
+    this.load_pdb_and_maps(pdb, map1, map2, {format: 'ccp4'}, callback);
+  }
+
+  // pdb_id here should be lowercase ('1abc')
+  load_from_pdbe(pdb_id, callback) {
+    const id = pdb_id.toLowerCase();
+    this.load_pdb_and_maps(
+      'https://www.ebi.ac.uk/pdbe/entry-files/pdb' + id + '.ent',
+      'https://www.ebi.ac.uk/pdbe/coordinates/files/' + id + '.ccp4',
+      'https://www.ebi.ac.uk/pdbe/coordinates/files/' + id + '_diff.ccp4',
+      {format: 'ccp4'}, callback);
+  }
+  load_from_rcsb(pdb_id, callback) {
+    const id = pdb_id.toLowerCase();
+    this.load_pdb_and_maps(
+      'https://files.rcsb.org/download/' + id + '.pdb',
+      'https://edmaps.rcsb.org/maps/' + id + '_2fofc.dsn6',
+      'https://edmaps.rcsb.org/maps/' + id + '_fofc.dsn6',
+      {format: 'dsn6'}, callback);
+  }
+
+  // TODO: navigation window like in gimp and mifit
+  /*
+  show_nav(inset_id) {
+    var inset = document.getElementById(inset_id);
+    if (!inset) return;
+    inset.style.display = 'block';
+    var nav = {};
+    nav.renderer = new WebGLRenderer();
+    nav.renderer.setClearColor(0x555555, 1);
+    nav.renderer.setSize(200, 200);
+    inset.appendChild(nav.renderer.domElement);
+    //nav.scene = new Scene();
+    nav.scene = this.scene;
+    //nav.scene.add(new AmbientLight(0xffffff));
+    this.nav = nav;
+  };
+  */
+}
+
+Viewer.prototype.MOUSE_HELP = [
+  '<b>mouse:</b>',
+  'Left = rotate',
+  'Middle or Ctrl+Left = pan',
+  'Right = zoom',
+  'Ctrl+Right = clipping',
+  'Ctrl+Shift+Right = roll',
+  'Wheel = σ level',
+  'Shift+Wheel = diff map σ',
+].join('\n');
+
+Viewer.prototype.KEYBOARD_HELP = [
+  '<b>keyboard:</b>',
+  'H = toggle help',
+  'S = general style',
+  'L = ligand style',
+  'T = water style',
+  'C = coloring',
+  'B = bg color',
+  'E = toggle fog',
+  'Q = label font',
+  '+/- = sigma level',
+  ']/[ = map radius',
+  'D/F = clip width',
+  '&lt;/> = move clip',
+  'M/N = zoom',
+  'U = unitcell box',
+  'Y = hydrogens',
+  'V = inactive models',
+  'R = center view',
+  'W = wireframe style',
+  'I = spin',
+  'K = rock',
+  'Home/End = stick width',
+  'P = nearest Cα',
+  'Ctrl+G = go to CID',
+  'Shift+P = permalink',
+  '(Shift+)space = next res.',
+  'Shift+F = full screen',
+].join('\n');
+
+Viewer.prototype.ABOUT_HELP =
+  '&nbsp; <a href="https://uglymol.github.io">GemmiMol</a> ' +
+  // @ts-expect-error Cannot find name 'VERSION'
+  (typeof VERSION === 'string' ? VERSION : 'dev');
+
+Viewer.prototype.ColorSchemes = ColorSchemes$1;
+
+function to_col(num) { return new Color(num); }
+
+const ColorSchemes = {
+  'solarized dark': {
+    bg: new Color(0x002b36),
+    fg: new Color(0xfdf6e3),
+    map_den: new Color(0xeee8d5),
+    center: new Color(0xfdf6e3),
+    lattices: [0xdc322f, 0x2aa198, 0x268bd2, 0x859900,
+               0xd33682, 0xb58900, 0x6c71c4, 0xcb4b16].map(to_col),
+    axes: [0xffaaaa, 0xaaffaa, 0xaaaaff].map(to_col),
+  },
+  'solarized light': {
+    bg: new Color(0xfdf6e3),
+    fg: new Color(0x002b36),
+    map_den: new Color(0x073642),
+    center: new Color(0x002b36),
+    lattices: [0xdc322f, 0x2aa198, 0x268bd2, 0x859900,
+               0xd33682, 0xb58900, 0x6c71c4, 0xcb4b16].map(to_col),
+    axes: [0xffaaaa, 0xaaffaa, 0xaaaaff].map(to_col),
+  },
+};
+
+// options handled by Viewer#select_next()
+const SPOT_SEL = ['all', 'unindexed', '#1']; //extended when needed
+const SHOW_AXES = ['two', 'three', 'none'];
+const SPOT_SHAPES = ['wheel', 'square'];
+
+// Modified ElMap for handling output of dials.rs_mapper.
+// rs_mapper outputs map in ccp4 format, but we need to rescale it,
+// shift it so the box is centered at 0,0,0,
+// and the translational symmetry doesn't apply.
+class ReciprocalSpaceMap extends ElMap {
+  
+
+  constructor(buf, gemmi) {
+    super();
+    this.box_size = [1, 1, 1];
+    this.from_ccp4(buf, false, gemmi);
+    if (this.unit_cell == null) return;
+    // unit of the map from dials.rs_mapper is (100A)^-1, we scale it to A^-1
+    // We assume the "unit cell" is cubic -- as it is in rs_mapper.
+    const par = this.unit_cell.parameters;
+    this.box_size = [par[0]/ 100, par[1] / 100, par[2] / 100];
+    this.unit_cell = null;
+  }
+
+  extract_block(radius, center) {
+    const grid = this.grid;
+    if (grid == null) return;
+    const b = this.box_size;
+    const lo_bounds = [];
+    const hi_bounds = [];
+    for (let n = 0; n < 3; n++) {
+      let lo = Math.floor(grid.dim[n] * ((center[n] - radius) / b[n] + 0.5));
+      let hi = Math.floor(grid.dim[n] * ((center[n] + radius) / b[n] + 0.5));
+      lo = Math.min(Math.max(0, lo), grid.dim[n] - 1);
+      hi = Math.min(Math.max(0, hi), grid.dim[n] - 1);
+      if (lo === hi) return;
+      lo_bounds.push(lo);
+      hi_bounds.push(hi);
+    }
+
+    const points = [];
+    const values = [];
+    for (let i = lo_bounds[0]; i <= hi_bounds[0]; i++) {
+      for (let j = lo_bounds[1]; j <= hi_bounds[1]; j++) {
+        for (let k = lo_bounds[2]; k <= hi_bounds[2]; k++) {
+          points.push([(i / grid.dim[0] - 0.5) * b[0],
+                       (j / grid.dim[1] - 0.5) * b[1],
+                       (k / grid.dim[2] - 0.5) * b[2]]);
+          const index = grid.grid2index_unchecked(i, j, k);
+          values.push(grid.values[index]);
+        }
+      }
+    }
+
+    const size = [hi_bounds[0] - lo_bounds[0] + 1,
+                        hi_bounds[1] - lo_bounds[1] + 1,
+                        hi_bounds[2] - lo_bounds[2] + 1];
+    this.block.set(points, values, size);
+  }
+}
+
+ReciprocalSpaceMap.prototype.unit = '';
+
+function find_max_dist(pos) {
+  let max_sq = 0;
+  for (let i = 0; i < pos.length; i += 3) {
+    const sq = pos[i]*pos[i] + pos[i+1]*pos[i+1] + pos[i+2]*pos[i+2];
+    if (sq > max_sq) max_sq = sq;
+  }
+  return Math.sqrt(max_sq);
+}
+
+function max_val(arr) {
+  let max = -Infinity;
+  for (let i = 0; i < arr.length; i++) {
+    if (arr[i] > max) max = arr[i];
+  }
+  return max;
+}
+
+
+
+function parse_csv(text) {
+  const lines = text.split('\n').filter(function (line) {
+    return line.length > 0 && line[0] !== '#';
+  });
+  const pos = new Float32Array(lines.length * 3);
+  const lattice_ids = [];
+  for (let i = 0; i < lines.length; i++) {
+    const nums = lines[i].split(',').map(Number);
+    for (let j = 0; j < 3; j++) {
+      pos[3*i+j] = nums[j];
+    }
+    lattice_ids.push(nums[3]);
+  }
+  return { pos, lattice_ids };
+}
+
+function minus_ones(n) {
+  return new Array(n).fill(-1);
+}
+
+function parse_json(text) {
+  const d = JSON.parse(text);
+  const n = d.rlp.length;
+  let pos;
+  if (n > 0 && d.rlp[0] instanceof Array) { // deprecated format
+    pos = new Float32Array(3*n);
+    for (let i = 0; i < n; i++) {
+      for (let j = 0; j < 3; j++) {
+        pos[3*i+j] = d.rlp[i][j];
+      }
+    }
+  } else { // flat array - new format
+    pos = new Float32Array(d.rlp);
+  }
+  const lattice_ids = d.experiment_id || minus_ones(n);
+  return { pos, lattice_ids };
+}
+
+const point_vert = `
+attribute vec3 color;
+attribute float group;
+uniform float show_only;
+uniform float r2_max;
+uniform float r2_min;
+uniform float size;
+varying vec3 vcolor;
+void main() {
+  vcolor = color;
+  float r2 = dot(position, position);
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  if (r2 < r2_min || r2 >= r2_max || (show_only != -2.0 && show_only != group))
+    gl_Position.x = 2.0;
+  gl_PointSize = size;
+}`;
+
+const round_point_frag = `
+${fog_pars_fragment}
+varying vec3 vcolor;
+void main() {
+  // not sure how reliable is such rounding of points
+  vec2 diff = gl_PointCoord - vec2(0.5, 0.5);
+  float dist_sq = 4.0 * dot(diff, diff);
+  if (dist_sq >= 1.0) discard;
+  float alpha = 1.0 - dist_sq * dist_sq * dist_sq;
+  gl_FragColor = vec4(vcolor, alpha);
+${fog_end_fragment}
+}`;
+
+const square_point_frag = `
+${fog_pars_fragment}
+varying vec3 vcolor;
+void main() {
+  gl_FragColor = vec4(vcolor, 1.0);
+${fog_end_fragment}
+}`;
+
+
+
+
+
+
+
+
+
+class ReciprocalViewer extends Viewer {
+  
+  
+  
+  
+  
+  
+  
+  
+  
+
+  constructor(options = {}) {
+    options.color_scheme = 'solarized dark';
+    super(options);
+    this.default_camera_pos = [100, 0, 0];
+    this.axes = null;
+    this.points = null;
+    this.max_dist = -1;
+    this.d_min = -1;
+    this.d_max_inv = 0;
+    this.config.show_only = SPOT_SEL[0];
+    this.config.show_axes = SHOW_AXES[0];
+    this.config.spot_shape = SPOT_SHAPES[0];
+    this.config.center_cube_size = 0.001;
+    this.set_reciprocal_key_bindings();
+    if (typeof document !== 'undefined') {
+      this.set_dropzone(this.renderer.domElement,
+                        this.file_drop_callback.bind(this));
+    }
+    this.point_material = new ShaderMaterial({
+      uniforms: makeUniforms({
+        size: 3,
+        show_only: -2,
+        r2_max: 100,
+        r2_min: 0,
+      }),
+      vertexShader: point_vert,
+      fragmentShader: round_point_frag,
+      fog: true,
+      transparent: true,
+      type: 'um_point',
+    });
+  }
+
+  set_reciprocal_key_bindings() {
+    const kb = this.key_bindings;
+    // a
+    kb[65] = function (evt) {
+      this.select_next('axes', 'show_axes', SHOW_AXES, evt.shiftKey);
+      this.set_axes();
+    };
+    // d
+    kb[68] = function () { this.change_slab_width_by(-0.01); };
+    // f
+    kb[70] = function (evt) {
+      if (evt.shiftKey) {
+        this.toggle_full_screen();
+      } else {
+        this.change_slab_width_by(0.01);
+      }
+    };
+    // p
+    kb[80] = function () { this.permalink(); };
+    // s
+    kb[83] = function (evt) {
+      this.select_next('spot shape', 'spot_shape', SPOT_SHAPES, evt.shiftKey);
+      if (this.config.spot_shape === 'wheel') {
+        this.point_material.fragmentShader = round_point_frag;
+      } else {
+        this.point_material.fragmentShader = square_point_frag;
+      }
+      this.point_material.needsUpdate = true;
+    };
+    // u
+    kb[85] = function () {
+      if (this.map_bags.length === 0) {
+        this.hud('Reciprocal-space density map not loaded.');
+        return;
+      }
+      this.hud('toggled map box');
+      this.toggle_cell_box();
+    };
+    // v
+    kb[86] = function (evt) {
+      this.select_next('show', 'show_only', SPOT_SEL, evt.shiftKey);
+      const idx = SPOT_SEL.indexOf(this.config.show_only);
+      this.point_material.uniforms.show_only.value = idx - 2;
+    };
+    // x
+    kb[88] = function (evt) {
+      if (evt.shiftKey) {
+        this.change_map_line(0.1);
+      } else {
+        this.change_point_size(0.5);
+      }
+    };
+    // z
+    kb[90] = function (evt) {
+      if (evt.shiftKey) {
+        this.change_map_line(-0.1);
+      } else {
+        this.change_point_size(-0.5);
+      }
+    };
+    // comma
+    kb[188] = function (evt) { if (evt.shiftKey) this.shift_clip(0.1); };
+    // period
+    kb[190] = function (evt) { if (evt.shiftKey) this.shift_clip(-0.1); };
+    // <-
+    kb[37] = function () { this.change_dmin(0.05); };
+    // ->
+    kb[39] = function () { this.change_dmin(-0.05); };
+    // up arrow
+    kb[38] = function () { this.change_dmax(0.025); };
+    // down arrow
+    kb[40] = function () { this.change_dmax(-0.025); };
+    // add, equals/firefox, equal sign
+    kb[107] = kb[61] = kb[187] = function () {
+      this.change_isolevel_by(0, 0.01);
+    };
+    // subtract, minus/firefox, dash
+    kb[109] = kb[173] = kb[189] = function () {
+      this.change_isolevel_by(0, -0.01);
+    };
+    // [
+    kb[219] = function () { this.change_map_radius(-1e-3); };
+    // ]
+    kb[221] = function () { this.change_map_radius(0.001); };
+  }
+
+  file_drop_callback(file) {
+    const self = this;
+    const reader = new FileReader();
+    if (/\.(map|ccp4)$/.test(file.name)) {
+      reader.onloadend = function (evt) {
+        if (evt.target.readyState == 2) {
+          self.load_map_from_ab(evt.target.result );
+        }
+      };
+      reader.readAsArrayBuffer(file);
+    } else {
+      reader.onload = function (evt) {
+        self.load_from_string(evt.target.result , {});
+      };
+      reader.readAsText(file);
+    }
+  }
+
+  load_data(url, options = {}) {
+    const self = this;
+    this.load_file(url, {binary: false, progress: true}, function (req) {
+      const ok = self.load_from_string(req.responseText, options);
+      if (ok && options.callback) options.callback();
+    });
+  }
+
+  load_from_string(text, options) {
+    if (text[0] === '{') {
+      this.data = parse_json(text);
+    } else if (text[0] === '#') {
+      this.data = parse_csv(text);
+    } else {
+      this.hud('Unrecognized file type.');
+      return false;
+    }
+    this.max_dist = find_max_dist(this.data.pos);
+    this.d_min = 1 / this.max_dist;
+    const last_group = max_val(this.data.lattice_ids);
+    SPOT_SEL.splice(3);
+    for (let i = 1; i <= last_group; i++) {
+      SPOT_SEL.push('#' + (i + 1));
+    }
+    this.set_axes();
+    this.set_points(this.data);
+    this.camera.zoom = 0.5 * (this.camera.top - this.camera.bottom);
+    // default scale is set to 100 - same as default_camera_pos
+    const d = 1.01 * this.max_dist;
+    this.controls.slab_width = [d, d, 100];
+    this.set_view(options);
+    this.hud('Loaded ' + this.data.pos.length + ' spots.');
+    return true;
+  }
+
+  load_map_from_ab(buffer) {
+    const self = this;
+    this.resolve_gemmi().then(function (gemmi) {
+      if (gemmi == null) throw Error('Gemmi is required for CCP4 map loading.');
+      if (self.map_bags.length > 0) {
+        self.clear_el_objects(self.map_bags.pop());
+      }
+      const map = new ReciprocalSpaceMap(buffer, gemmi);
+      const map_range = map.box_size[0] / 2;
+      self.config.map_radius = Math.round(map_range / 2 * 100) / 100;
+      self.config.max_map_radius = Math.round(1.5 * map_range * 100) / 100;
+      self.config.default_isolevel = 2.0;
+      self.add_map(map, false);
+      const map_dmin = 1 / map_range;
+      let msg = 'Loaded density map (' + map_dmin.toFixed(2) + 'Å).\n';
+      if (self.points !== null && map_dmin > self.d_min) {
+        msg += 'Adjusted spot clipping. ';
+        self.change_dmin(map_dmin - self.d_min);
+      }
+      self.hud(msg + 'Use +/- to change the isolevel.');
+    }, function (e) {
+      self.hud(e.message, 'ERR');
+    });
+  }
+
+  set_axes() {
+    if (this.axes != null) {
+      this.remove_and_dispose(this.axes);
+      this.axes = null;
+    }
+    if (this.config.show_axes === 'none') return;
+    const axis_length = 1.2 * this.max_dist;
+    const vertices = [];
+    addXyzCross(vertices, [0, 0, 0], axis_length);
+    const ca = this.config.colors.axes;
+    const colors = [ca[0], ca[0], ca[1], ca[1], ca[2], ca[2]];
+    if (this.config.show_axes === 'two') {
+      vertices.splice(4);
+      colors.splice(4);
+    }
+    const material = makeLineMaterial({
+      win_size: this.window_size,
+      linewidth: 3,
+    });
+    this.axes = makeLineSegments(material, vertices, colors);
+    this.scene.add(this.axes);
+  }
+
+  set_points(data) {
+    if (this.points != null) {
+      this.remove_and_dispose(this.points);
+      this.points = null;
+    }
+    if (data == null || data.lattice_ids == null || data.pos == null) return;
+    const color_arr = new Float32Array(3 * data.lattice_ids.length);
+    this.colorize_by_id(color_arr, data.lattice_ids);
+    const geometry = new BufferGeometry();
+    geometry.setAttribute('position', new BufferAttribute(data.pos, 3));
+    geometry.setAttribute('color', new BufferAttribute(color_arr, 3));
+    const groups = new Float32Array(data.lattice_ids);
+    geometry.setAttribute('group', new BufferAttribute(groups, 1));
+    this.points = new Points(geometry, this.point_material);
+    this.scene.add(this.points);
+    this.request_render();
+  }
+
+  colorize_by_id(color_arr, group_id) {
+    const palette = this.config.colors.lattices;
+    for (let i = 0; i < group_id.length; i++) {
+      const c = palette[(group_id[i] + 1) % 4];
+      color_arr[3*i] = c.r;
+      color_arr[3*i+1] = c.g;
+      color_arr[3*i+2] = c.b;
+    }
+  }
+
+  mousewheel_action(delta) {
+    this.change_zoom_by_factor(1 + 0.0005 * delta);
+  }
+
+  change_point_size(delta) {
+    const size = this.point_material.uniforms.size;
+    size.value = Math.max(size.value + delta, 0.5);
+    this.hud('point size: ' + size.value.toFixed(1));
+  }
+
+  change_dmin(delta) {
+    this.d_min = Math.max(this.d_min + delta, 0.1);
+    const dmax = this.d_max_inv > 0 ? 1 / this.d_max_inv : null;
+    if (dmax !== null && this.d_min > dmax) this.d_min = dmax;
+    this.point_material.uniforms.r2_max.value = 1 / (this.d_min * this.d_min);
+    const low_res = dmax !== null ? dmax.toFixed(2) : '∞';
+    this.hud('res. limit: ' + low_res + ' - ' + this.d_min.toFixed(2) + 'Å');
+  }
+
+  change_dmax(delta) {
+    let v = Math.min(this.d_max_inv + delta, 1 / this.d_min);
+    if (v < 1e-6) v = 0;
+    this.d_max_inv = v;
+    this.point_material.uniforms.r2_min.value = v * v;
+    const low_res = v > 0 ? (1 / v).toFixed(2) : '∞';
+    this.hud('res. limit: ' + low_res + ' - ' + this.d_min.toFixed(2) + 'Å');
+  }
+
+  redraw_models() {
+    this.set_points(this.data);
+  }
+
+  get_cell_box_func() {
+    if (this.map_bags.length === 0) return null;
+    // here the map is ReciprocalSpaceMap not ElMap
+    const a = this.map_bags[0].map.box_size;
+    return function (xyz) {
+      return [(xyz[0]-0.5) * a[0], (xyz[1]-0.5) * a[1], (xyz[2]-0.5) * a[2]];
+    };
+  }
+}
+
+ReciprocalViewer.prototype.KEYBOARD_HELP = [
+  '<b>keyboard:</b>',
+  'H = toggle help',
+  'V = show (un)indexed',
+  'A = toggle axes',
+  'U = toggle map box',
+  'B = bg color',
+  'E = toggle fog',
+  'M/N = zoom',
+  'D/F = clip width',
+  '&lt;/> = move clip',
+  'R = center view',
+  'Z/X = point size',
+  'S = point shape',
+  'Shift+P = permalink',
+  'Shift+F = full screen',
+  '←/→ = max resol.',
+  '↑/↓ = min resol.',
+  '+/- = map level',
+].join('\n');
+
+ReciprocalViewer.prototype.MOUSE_HELP =
+    Viewer.prototype.MOUSE_HELP.split('\n').slice(0, -2).join('\n');
+
+ReciprocalViewer.prototype.ColorSchemes = ColorSchemes;
+
+function log_timing(t0, text) {
+  console.log(text + ': ' + (performance.now() - t0).toFixed(2) + ' ms.');
+}
+
+function add_map_from_mtz(viewer, mtz, map_data, is_diff) {
+  const map = new ElMap();
+  const mc = mtz.cell;
+  map.unit_cell = new UnitCell(mc.a, mc.b, mc.c, mc.alpha, mc.beta, mc.gamma);
+  map.stats.rms = mtz.rmsd;
+  map.grid = new GridArray([mtz.nx, mtz.ny, mtz.nz]);
+  map.grid.values.set(map_data);
+  viewer.add_map(map, is_diff);
+}
+
+function load_maps_from_mtz_buffer(viewer, mtz,
+                                   labels) {
+  if (labels != null) {
+    for (let n = 0; n < labels.length; n += 2) {
+      if (labels[n] === '') continue;
+      const t0 = performance.now();
+      const map_data = mtz.calculate_map_from_labels(labels[n], labels[n+1]);
+      log_timing(t0, 'map ' + mtz.nx + 'x' + mtz.ny + 'x' + mtz.nz +
+                     ' calculated in');
+      if (map_data == null) {
+        viewer.hud(mtz.last_error, 'ERR');
+        continue;
+      }
+      const is_diff = (n % 4 == 2);
+      add_map_from_mtz(viewer, mtz, map_data, is_diff);
+    }
+  } else {  // use default labels
+    for (let nmap = 0; nmap < 2; ++nmap) {
+      const is_diff = (nmap == 1);
+      const t0 = performance.now();
+      const map_data = mtz.calculate_map(is_diff);
+      log_timing(t0, 'map ' + mtz.nx + 'x' + mtz.ny + 'x' + mtz.nz +
+                     ' calculated in');
+      if (map_data != null) {
+        add_map_from_mtz(viewer, mtz, map_data, is_diff);
+      }
+    }
+  }
+  mtz.delete();
+}
+
+function load_maps_from_mtz(gemmi, viewer, url,
+                            labels, callback) {
+  viewer.load_file(url, {binary: true, progress: true}, function (req) {
+    const t0 = performance.now();
+    try {
+      const mtz = gemmi.readMtz(req.response);
+      //console.log("[after readMTZ] wasm mem:", gemmi.HEAPU8.length / 1024, "kb");
+      load_maps_from_mtz_buffer(viewer, mtz, labels);
+    } catch (e) {
+      viewer.hud(e.message, 'ERR');
+      return;
+    }
+    log_timing(t0, 'load_maps_from_mtz');
+    //console.log("wasm mem:", gemmi.HEAPU8.length / 1024, "kb");
+    if (callback) callback();
+  });
+}
+
+function set_pdb_and_mtz_dropzone(gemmi, viewer,
+                                  zone) {
+  viewer.set_dropzone(zone, function (file) {
+    if (/\.mtz$/.test(file.name)) {
+      const reader = new FileReader();
+      reader.onloadend = function (evt) {
+        if (evt.target.readyState === 2) {
+          const t0 = performance.now();
+          try {
+            const mtz = gemmi.readMtz(evt.target.result);
+            load_maps_from_mtz_buffer(viewer, mtz);
+          } catch (e) {
+            viewer.hud(e.message, 'ERR');
+            return;
+          }
+          log_timing(t0, 'mtz -> maps');
+          if (viewer.model_bags.length === 0 && viewer.map_bags.length <= 2) {
+            viewer.recenter();
+          }
+        }
+      };
+      reader.readAsArrayBuffer(file);
+    } else {
+      viewer.pick_pdb_and_map(file);
+    }
+  });
+}
+
+exports.Block = Block;
+exports.BondType = BondType;
+exports.BufferAttribute = BufferAttribute;
+exports.BufferGeometry = BufferGeometry;
+exports.Color = Color;
+exports.Controls = Controls;
+exports.ElMap = ElMap;
+exports.Fog = Fog;
+exports.GridArray = GridArray;
+exports.Label = Label;
+exports.Line = Line;
+exports.LineSegments = LineSegments;
+exports.Matrix4 = Matrix4;
+exports.Mesh = Mesh;
+exports.Model = Model;
+exports.Object3D = Object3D;
+exports.OrthographicCamera = OrthographicCamera;
+exports.Points = Points;
+exports.Quaternion = Quaternion;
+exports.Ray = Ray;
+exports.ReciprocalSpaceMap = ReciprocalSpaceMap;
+exports.ReciprocalViewer = ReciprocalViewer;
+exports.STATE = STATE;
+exports.Scene = Scene;
+exports.ShaderMaterial = ShaderMaterial;
+exports.Texture = Texture;
+exports.UnitCell = UnitCell;
+exports.Vector3 = Vector3;
+exports.Viewer = Viewer;
+exports.WebGLRenderer = WebGLRenderer;
+exports.addXyzCross = addXyzCross;
+exports.fog_end_fragment = fog_end_fragment;
+exports.fog_pars_fragment = fog_pars_fragment;
+exports.load_maps_from_mtz = load_maps_from_mtz;
+exports.load_maps_from_mtz_buffer = load_maps_from_mtz_buffer;
+exports.makeBalls = makeBalls;
+exports.makeChickenWire = makeChickenWire;
+exports.makeCube = makeCube;
+exports.makeGrid = makeGrid;
+exports.makeLineMaterial = makeLineMaterial;
+exports.makeLineSegments = makeLineSegments;
+exports.makeLines = makeLines;
+exports.makeMultiColorLines = makeMultiColorLines;
+exports.makeRgbBox = makeRgbBox;
+exports.makeRibbon = makeRibbon;
+exports.makeSticks = makeSticks;
+exports.makeUniforms = makeUniforms;
+exports.makeWheels = makeWheels;
+exports.modelsFromGemmi = modelsFromGemmi;
+exports.set_pdb_and_mtz_dropzone = set_pdb_and_mtz_dropzone;
+
+}));

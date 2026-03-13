@@ -1,6 +1,6 @@
 
 var util = util || require('./util'); // eslint-disable-line
-var UM = UM || require('../uglymol'); // eslint-disable-line
+var GM = GM || require('../gemmimol'); // eslint-disable-line
 
 (function () {  // namespace is needed for perf.html
 'use strict';
@@ -8,10 +8,10 @@ var UM = UM || require('../uglymol'); // eslint-disable-line
 const pdb_string = util.open_as_utf8('1mru.pdb');
 const cmap_buf = util.open_as_array_buffer('1mru.map');
 
-let viewer = new UM.Viewer({});
-let model = UM.modelsFromPDB(pdb_string)[0];
+let viewer = new GM.Viewer({});
+let model = GM.modelsFromPDB(pdb_string)[0];
 viewer.add_model(model);
-let emap = new UM.ElMap();
+let emap = new GM.ElMap();
 emap.from_ccp4(cmap_buf);
 
 util.bench('add trace', function () {

@@ -102,7 +102,7 @@ const ColorSchemes /*:ColorScheme[]*/ = [ // Viewer.prototype.ColorSchemes
   },
 ];
 
-const INIT_HUD_TEXT = 'This is UglyMol not Coot. ' +
+const INIT_HUD_TEXT = 'This is GemmiMol not Coot. ' +
   '<a href="#" onclick="V.toggle_help(); return false;">H shows help.</a>';
 
 // options handled by select_next()
@@ -1719,7 +1719,7 @@ Viewer.prototype.KEYBOARD_HELP = [
 ].join('\n');
 
 Viewer.prototype.ABOUT_HELP =
-  '&nbsp; <a href="https://uglymol.github.io">uglymol</a> ' +
+  '&nbsp; <a href="https://gemmimol.github.io">gemmimol</a> ' +
   // $FlowFixMe: Cannot resolve name VERSION.
   (typeof VERSION === 'string' ? VERSION : 'dev'); // eslint-disable-line
 

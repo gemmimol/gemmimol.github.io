@@ -1,4 +1,4 @@
-// a small subset of THREE.js v83 that is used by UglyMol
+// a small subset of THREE.js v83 that is used by GemmiMol
 // modified with eslint --fix and manually,
 // LICENSE: threejs.org/license (MIT)
 

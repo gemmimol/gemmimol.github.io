@@ -12,7 +12,7 @@ function data_path(filename) {
     fs.statSync(path);
   } catch (e) {
     console.log('we need to download ' + filename + ' (only once)');
-    const url = 'http://uglymol.github.io/data/' + filename;
+    const url = 'http://gemmimol.github.io/data/' + filename;
     const cmd = 'curl -f ' + url + ' -o ' + path;
     if (!child_process.execSync) {
       console.log('no execSync (in Node v0.11.12+), you need to:\n' + cmd);
