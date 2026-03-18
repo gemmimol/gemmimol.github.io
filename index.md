@@ -2,11 +2,10 @@
 layout: default
 ---
 
-
 GemmiMol is a web-based macromolecular viewer focused on electron density.
 It is a successor of the deprecated UglyMol.
 
-It makes models and e.den. maps easy to recognize, navigate and interpret --
+It makes models and e.den. maps easy to recognize, navigate and interpret --:
 for crystallographers.
 It looks like [Coot](http://www2.mrc-lmb.cam.ac.uk/personal/pemsley/coot/)
 and walks (mouse controls) like Coot.
@@ -21,7 +20,7 @@ that provides the data access
 Try it:
 
 - [1MRU](1mru.html) (60kDa, 3Å),
-  and in [dual view](https://gemmimol.github.io/dual.html) with PDB_REDO,
+  and in [dual view](dual.html) with PDB_REDO,
 - [a blob](dimple_thaum.html#xyz=14,18,12&eye=80,71,-41&zoom=70)
   (Dimple result, thaumatin, 1.4Å),
 - or any [local file or wwPDB entry](view/).

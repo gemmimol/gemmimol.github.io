@@ -16,7 +16,7 @@ function print_map_stats() {
 var setup = util.load_gemmi().then(function (gemmi) {
   util.bench('ElMap#from_dsn6', function () {
     map = new GM.ElMap();
-    map.from_dsn6(dsn6_buf.slice(0));
+    map.from_dsn6(dsn6_buf.slice(0), gemmi);
   }, {onComplete: print_map_stats});
 
   util.bench('ElMap#from_ccp4 mode0', function () {
@@ -29,8 +29,8 @@ var setup = util.load_gemmi().then(function (gemmi) {
     map.from_ccp4(map2_buf.slice(0), true, gemmi);
   }, {onComplete: print_map_stats});
 
-  util.bench('ElMap#extract_block', function () {
-    map.extract_block(15, [25, 26, 35]);
+  util.bench('ElMap#prepare_isosurface', function () {
+    map.prepare_isosurface(15, [25, 26, 35]);
   });
 });
 

@@ -14,77 +14,6 @@ typeof define === 'function' && define.amd ? define(['exports'], factory) :
 var VERSION = exports.VERSION = '0.8.0';
 
 
-class UnitCell {
-  
-  
-  
-
-  constructor(a, b, c,
-              alpha, beta, gamma) {
-    if (a <= 0 || b <= 0 || c <= 0 || alpha <= 0 || beta <= 0 || gamma <= 0) {
-      throw Error('Zero or negative unit cell parameter(s).');
-    }
-    this.parameters = [a, b, c, alpha, beta, gamma];
-    const deg2rad = Math.PI / 180.0;
-    const cos_alpha = Math.cos(deg2rad * alpha);
-    const cos_beta = Math.cos(deg2rad * beta);
-    const cos_gamma = Math.cos(deg2rad * gamma);
-    const sin_alpha = Math.sin(deg2rad * alpha);
-    const sin_beta = Math.sin(deg2rad * beta);
-    const sin_gamma = Math.sin(deg2rad * gamma);
-    if (sin_alpha === 0 || sin_beta === 0 || sin_gamma === 0) {
-      throw Error('Impossible angle - N*180deg.');
-    }
-    const cos_alpha_star_sin_beta = (cos_beta * cos_gamma - cos_alpha) /
-                                    sin_gamma;
-    const cos_alpha_star = cos_alpha_star_sin_beta / sin_beta;
-    const s1rca2 = Math.sqrt(1.0 - cos_alpha_star * cos_alpha_star);
-    // The orthogonalization matrix we use is described in ITfC B p.262:
-    // "An alternative mode of orthogonalization, used by the Protein
-    // Data Bank and most programs, is to align the a1 axis of the unit
-    // cell with the Cartesian X_1 axis, and to align the a*_3 axis with the
-    // Cartesian X_3 axis."
-    //
-    // Zeros in the matrices below are kept to make matrix multiplication
-    // faster: they make extract_block() 2x (!) faster on V8 4.5.103,
-    // no difference on FF 50.
-    /* eslint-disable no-multi-spaces */
-    this.orth = [a,   b * cos_gamma,  c * cos_beta,
-                 0.0, b * sin_gamma, -c * cos_alpha_star_sin_beta,
-                 0.0, 0.0          ,  c * sin_beta * s1rca2];
-    // based on xtal.js which is based on cctbx.uctbx
-    this.frac = [
-      1.0 / a,
-      -cos_gamma / (sin_gamma * a),
-      -(cos_gamma * cos_alpha_star_sin_beta + cos_beta * sin_gamma) /
-          (sin_beta * s1rca2 * sin_gamma * a),
-      0.0,
-      1.0 / (sin_gamma * b),
-      cos_alpha_star / (s1rca2 * sin_gamma * b),
-      0.0,
-      0.0,
-      1.0 / (sin_beta * s1rca2 * c),
-    ];
-  }
-
-  fractionalize(xyz) {
-    return multiply(xyz, this.frac);
-  }
-
-  orthogonalize(xyz) {
-    return multiply(xyz, this.orth);
-  }
-}
-
-// This function is only used with matrices frac and orth, which have 3 zeros.
-// We skip these elements, but it doesn't affect performance (on FF50 and V8).
-function multiply(xyz, mat) {
-  /* eslint-disable indent, no-multi-spaces */
-  return [mat[0] * xyz[0]  + mat[1] * xyz[1]  + mat[2] * xyz[2],
-        /*mat[3] * xyz[0]*/+ mat[4] * xyz[1]  + mat[5] * xyz[2],
-        /*mat[6] * xyz[0]  + mat[7] * xyz[1]*/+ mat[8] * xyz[2]];
-}
-
 const BondType = {
   Unspec: 0,
   Single: 1,
@@ -158,7 +87,7 @@ function modelsFromGemmi(gemmi, buffer, name,
       const model = st.at(i_model);
       const m = new Model();
       m.source_model_index = i_model;
-      m.unit_cell = new UnitCell(cell.a, cell.b, cell.c, cell.alpha, cell.beta, cell.gamma);
+      m.unit_cell = new gemmi.UnitCell(cell.a, cell.b, cell.c, cell.alpha, cell.beta, cell.gamma);
       let atom_i_seq = 0;
       for (let i_chain = 0; i_chain < model.length; ++i_chain) {
         const chain = model.at(i_chain);
@@ -597,691 +526,6 @@ class Cubicles {
   }
 }
 
-class Block {
-  
-  
-  
-  constructor() {
-    this._points = null;
-    this._values = null;
-    this._size = [0, 0, 0];
-  }
-
-  set(points, values, size) {
-    if (size[0] <= 0 || size[1] <= 0 || size[2] <= 0) {
-      throw Error('Grid dimensions are zero along at least one edge');
-    }
-    const len = size[0] * size[1] * size[2];
-    if (values.length !== len || points.length !== len) {
-      throw Error('isosurface: array size mismatch');
-    }
-
-    this._points = points;
-    this._values = values;
-    this._size = size;
-  }
-
-  clear() {
-    this._points = null;
-    this._values = null;
-  }
-
-  empty()  {
-    return this._values === null;
-  }
-
-  isosurface(isolevel, method) {
-    //if (method === 'marching tetrahedra') {
-    //  return marchingTetrahedra(block, isolevel);
-    //}
-    return marchingCubes(this._size, this._values, this._points,
-                         isolevel, method);
-  }
-}
-
-/* eslint comma-spacing: 0, no-multi-spaces: 0 */
-
-const edgeTable = new Int32Array([
-  0x0  , 0x0  , 0x202, 0x302, 0x406, 0x406, 0x604, 0x704,
-  0x804, 0x805, 0xa06, 0xa06, 0xc0a, 0xd03, 0xe08, 0xf00,
-  0x90 , 0x98 , 0x292, 0x292, 0x496, 0x49e, 0x694, 0x694,
-  0x894, 0x894, 0xa96, 0xa96, 0xc9a, 0xc92, 0xe91, 0xe90,
-  0x230, 0x230, 0x33 , 0x13a, 0x636, 0x636, 0x434, 0x43c,
-  0xa34, 0xa35, 0x837, 0x936, 0xe3a, 0xf32, 0xc31, 0xd30,
-  0x2a0, 0x2a8, 0xa3 , 0xaa , 0x6a6, 0x6af, 0x5a4, 0x4ac,
-  0xaa4, 0xaa4, 0x9a6, 0x8a6, 0xfaa, 0xea3, 0xca1, 0xca0,
-  0x460, 0x460, 0x662, 0x762, 0x66 , 0x66 , 0x265, 0x364,
-  0xc64, 0xc65, 0xe66, 0xe66, 0x86a, 0x863, 0xa69, 0xa60,
-  0x4f0, 0x4f8, 0x6f2, 0x6f2, 0xf6 , 0xfe , 0x2f5, 0x2fc,
-  0xcf4, 0xcf4, 0xef6, 0xef6, 0x8fa, 0x8f3, 0xaf9, 0xaf0,
-  0x650, 0x650, 0x453, 0x552, 0x256, 0x256, 0x54 , 0x154,
-  0xe54, 0xf54, 0xc57, 0xd56, 0xa5a, 0xb52, 0x859, 0x950,
-  0x7c0, 0x6c1, 0x5c2, 0x4c2, 0x3c6, 0x2ce, 0xc5 , 0xc4 ,
-  0xfc4, 0xec5, 0xdc6, 0xcc6, 0xbca, 0xac2, 0x8c1, 0x8c0,
-  0x8c0, 0x8c0, 0xac2, 0xbc2, 0xcc6, 0xcc6, 0xec4, 0xfcc,
-  0xc4 , 0xc5 , 0x2c6, 0x3c6, 0x4c2, 0x5c2, 0x6c1, 0x7c0,
-  0x950, 0x859, 0xb52, 0xa5a, 0xd56, 0xc57, 0xe54, 0xe5c,
-  0x154, 0x54 , 0x25e, 0x256, 0x552, 0x453, 0x658, 0x650,
-  0xaf0, 0xaf0, 0x8f3, 0x8fa, 0xef6, 0xef6, 0xcf4, 0xcfc,
-  0x2f4, 0x3f5, 0xff , 0x1f6, 0x6f2, 0x6f3, 0x4f9, 0x5f0,
-  0xa60, 0xa69, 0x863, 0x86a, 0xe66, 0xe67, 0xd65, 0xc6c,
-  0x364, 0x265, 0x166, 0x66 , 0x76a, 0x663, 0x460, 0x460,
-  0xca0, 0xca0, 0xea2, 0xfa2, 0x8a6, 0x8a6, 0xaa4, 0xba4,
-  0x4ac, 0x5a4, 0x6ae, 0x7a6, 0xaa , 0xa3 , 0x2a8, 0x2a0,
-  0xd30, 0xc31, 0xf32, 0xe3a, 0x936, 0x837, 0xb35, 0xa34,
-  0x43c, 0x434, 0x73e, 0x636, 0x13a, 0x33 , 0x339, 0x230,
-  0xe90, 0xe90, 0xc92, 0xc9a, 0xa96, 0xa96, 0x894, 0x89c,
-  0x694, 0x695, 0x49f, 0x496, 0x292, 0x392, 0x98 , 0x90 ,
-  0xf00, 0xe08, 0xd03, 0xc0a, 0xa06, 0xa0e, 0x805, 0x804,
-  0x704, 0x604, 0x506, 0x406, 0x302, 0x202, 0x0  , 0x0]);
-
-
-// generated from classical triTable by tools/isolut.py
-const segTable = [
-  [],
-  [],
-  [1, 9],
-  [1, 8, 1, 9],
-  [2, 10, 10, 1],
-  [2, 10, 10, 1],
-  [9, 2, 2, 10, 10, 9],
-  [2, 8, 2, 10, 10, 8, 10, 9],
-  [11, 2],
-  [0, 11, 11, 2],
-  [1, 9, 11, 2],
-  [1, 11, 11, 2, 1, 9, 9, 11],
-  [3, 10, 10, 1, 11, 10],
-  [0, 10, 10, 1, 8, 10, 11, 10],
-  [3, 9, 11, 9, 11, 10, 10, 9],
-  [8, 10, 10, 9, 11, 10],
-  [4, 7],
-  [4, 3, 4, 7],
-  [1, 9, 4, 7],
-  [4, 1, 1, 9, 4, 7, 7, 1],
-  [2, 10, 10, 1, 4, 7],
-  [3, 4, 4, 7, 2, 10, 10, 1],
-  [9, 2, 2, 10, 10, 9, 4, 7],
-  [2, 10, 10, 9, 9, 2, 9, 7, 7, 2, 4, 7],
-  [4, 7, 11, 2],
-  [11, 4, 4, 7, 11, 2, 2, 4],
-  [1, 9, 4, 7, 11, 2],
-  [4, 7, 11, 4, 11, 9, 11, 2, 2, 9, 1, 9],
-  [3, 10, 10, 1, 11, 10, 4, 7],
-  [1, 11, 11, 10, 10, 1, 1, 4, 4, 11, 4, 7],
-  [4, 7, 0, 11, 11, 9, 11, 10, 10, 9],
-  [4, 7, 11, 4, 11, 9, 11, 10, 10, 9],
-  [9, 5, 5, 4],
-  [9, 5, 5, 4],
-  [0, 5, 5, 4, 1, 5],
-  [8, 5, 5, 4, 3, 5, 1, 5],
-  [2, 10, 10, 1, 9, 5, 5, 4],
-  [2, 10, 10, 1, 9, 5, 5, 4],
-  [5, 2, 2, 10, 10, 5, 5, 4, 4, 2],
-  [2, 10, 10, 5, 5, 2, 5, 3, 5, 4, 4, 3],
-  [9, 5, 5, 4, 11, 2],
-  [0, 11, 11, 2, 9, 5, 5, 4],
-  [0, 5, 5, 4, 1, 5, 11, 2],
-  [1, 5, 5, 2, 5, 8, 8, 2, 11, 2, 5, 4],
-  [10, 3, 11, 10, 10, 1, 9, 5, 5, 4],
-  [9, 5, 5, 4, 8, 1, 8, 10, 10, 1, 11, 10],
-  [5, 4, 0, 5, 0, 11, 11, 5, 11, 10, 10, 5],
-  [5, 4, 8, 5, 8, 10, 10, 5, 11, 10],
-  [9, 7, 5, 7, 9, 5],
-  [9, 3, 9, 5, 5, 3, 5, 7],
-  [0, 7, 1, 7, 1, 5, 5, 7],
-  [1, 5, 5, 3, 5, 7],
-  [9, 7, 9, 5, 5, 7, 10, 1, 2, 10],
-  [10, 1, 2, 10, 9, 5, 5, 0, 5, 3, 5, 7],
-  [2, 8, 2, 5, 5, 8, 5, 7, 10, 5, 2, 10],
-  [2, 10, 10, 5, 5, 2, 5, 3, 5, 7],
-  [7, 9, 9, 5, 5, 7, 11, 2],
-  [9, 5, 5, 7, 7, 9, 7, 2, 2, 9, 11, 2],
-  [11, 2, 1, 8, 1, 7, 1, 5, 5, 7],
-  [11, 2, 1, 11, 1, 7, 1, 5, 5, 7],
-  [9, 5, 5, 8, 5, 7, 10, 1, 3, 10, 11, 10],
-  [5, 7, 7, 0, 0, 5, 9, 5, 11, 0, 0, 10, 10, 1, 11, 10],
-  [11, 10, 10, 0, 0, 11, 10, 5, 5, 0, 0, 7, 5, 7],
-  [11, 10, 10, 5, 5, 11, 5, 7],
-  [10, 6, 6, 5, 5, 10],
-  [5, 10, 10, 6, 6, 5],
-  [1, 9, 5, 10, 10, 6, 6, 5],
-  [1, 8, 1, 9, 5, 10, 10, 6, 6, 5],
-  [1, 6, 6, 5, 5, 1, 2, 6],
-  [1, 6, 6, 5, 5, 1, 2, 6],
-  [9, 6, 6, 5, 5, 9, 0, 6, 2, 6],
-  [5, 9, 8, 5, 8, 2, 2, 5, 2, 6, 6, 5],
-  [11, 2, 10, 6, 6, 5, 5, 10],
-  [11, 0, 11, 2, 10, 6, 6, 5, 5, 10],
-  [1, 9, 11, 2, 5, 10, 10, 6, 6, 5],
-  [5, 10, 10, 6, 6, 5, 1, 9, 9, 2, 9, 11, 11, 2],
-  [6, 3, 11, 6, 6, 5, 5, 3, 5, 1],
-  [11, 0, 11, 5, 5, 0, 5, 1, 11, 6, 6, 5],
-  [11, 6, 6, 3, 6, 0, 6, 5, 5, 0, 5, 9],
-  [6, 5, 5, 9, 9, 6, 9, 11, 11, 6],
-  [5, 10, 10, 6, 6, 5, 4, 7],
-  [4, 3, 4, 7, 6, 5, 5, 10, 10, 6],
-  [1, 9, 5, 10, 10, 6, 6, 5, 4, 7],
-  [10, 6, 6, 5, 5, 10, 1, 9, 9, 7, 7, 1, 4, 7],
-  [6, 1, 2, 6, 6, 5, 5, 1, 4, 7],
-  [2, 5, 5, 1, 2, 6, 6, 5, 4, 3, 4, 7],
-  [4, 7, 0, 5, 5, 9, 0, 6, 6, 5, 2, 6],
-  [3, 9, 9, 7, 4, 7, 2, 9, 5, 9, 9, 6, 6, 5, 2, 6],
-  [11, 2, 4, 7, 10, 6, 6, 5, 5, 10],
-  [5, 10, 10, 6, 6, 5, 4, 7, 7, 2, 2, 4, 11, 2],
-  [1, 9, 4, 7, 11, 2, 5, 10, 10, 6, 6, 5],
-  [9, 2, 1, 9, 9, 11, 11, 2, 4, 11, 4, 7, 5, 10, 10, 6, 6, 5],
-  [4, 7, 11, 5, 5, 3, 5, 1, 11, 6, 6, 5],
-  [5, 1, 1, 11, 11, 5, 11, 6, 6, 5, 0, 11, 11, 4, 4, 7],
-  [0, 5, 5, 9, 0, 6, 6, 5, 3, 6, 11, 6, 4, 7],
-  [6, 5, 5, 9, 9, 6, 9, 11, 11, 6, 4, 7, 7, 9],
-  [10, 4, 9, 10, 6, 4, 10, 6],
-  [4, 10, 10, 6, 6, 4, 9, 10],
-  [10, 0, 1, 10, 10, 6, 6, 0, 6, 4],
-  [1, 8, 1, 6, 6, 8, 6, 4, 1, 10, 10, 6],
-  [1, 4, 9, 1, 2, 4, 2, 6, 6, 4],
-  [2, 9, 9, 1, 2, 4, 2, 6, 6, 4],
-  [2, 4, 2, 6, 6, 4],
-  [2, 8, 2, 4, 2, 6, 6, 4],
-  [10, 4, 9, 10, 10, 6, 6, 4, 11, 2],
-  [8, 2, 11, 2, 9, 10, 10, 4, 10, 6, 6, 4],
-  [11, 2, 1, 6, 6, 0, 6, 4, 1, 10, 10, 6],
-  [6, 4, 4, 1, 1, 6, 1, 10, 10, 6, 8, 1, 1, 11, 11, 2],
-  [9, 6, 6, 4, 9, 3, 3, 6, 9, 1, 11, 6],
-  [11, 1, 1, 8, 11, 6, 6, 1, 9, 1, 1, 4, 6, 4],
-  [11, 6, 6, 3, 6, 0, 6, 4],
-  [6, 4, 8, 6, 11, 6],
-  [7, 10, 10, 6, 6, 7, 8, 10, 9, 10],
-  [0, 7, 0, 10, 10, 7, 9, 10, 6, 7, 10, 6],
-  [10, 6, 6, 7, 7, 10, 1, 10, 7, 1, 8, 1],
-  [10, 6, 6, 7, 7, 10, 7, 1, 1, 10],
-  [2, 6, 6, 1, 6, 8, 8, 1, 9, 1, 6, 7],
-  [2, 6, 6, 9, 9, 2, 9, 1, 6, 7, 7, 9, 9, 3],
-  [0, 7, 0, 6, 6, 7, 2, 6],
-  [2, 7, 6, 7, 2, 6],
-  [11, 2, 10, 6, 6, 8, 8, 10, 9, 10, 6, 7],
-  [0, 7, 7, 2, 11, 2, 9, 7, 6, 7, 7, 10, 10, 6, 9, 10],
-  [1, 8, 1, 7, 1, 10, 10, 7, 6, 7, 10, 6, 11, 2],
-  [11, 2, 1, 11, 1, 7, 10, 6, 6, 1, 1, 10, 6, 7],
-  [9, 6, 6, 8, 6, 7, 9, 1, 1, 6, 11, 6, 6, 3],
-  [9, 1, 11, 6, 6, 7],
-  [0, 7, 0, 6, 6, 7, 11, 0, 11, 6],
-  [11, 6, 6, 7],
-  [7, 6, 6, 11],
-  [7, 6, 6, 11],
-  [1, 9, 7, 6, 6, 11],
-  [8, 1, 1, 9, 7, 6, 6, 11],
-  [10, 1, 2, 10, 6, 11, 7, 6],
-  [2, 10, 10, 1, 6, 11, 7, 6],
-  [2, 9, 2, 10, 10, 9, 6, 11, 7, 6],
-  [6, 11, 7, 6, 2, 10, 10, 3, 10, 8, 10, 9],
-  [7, 2, 6, 2, 7, 6],
-  [7, 0, 7, 6, 6, 0, 6, 2],
-  [2, 7, 7, 6, 6, 2, 1, 9],
-  [1, 6, 6, 2, 1, 8, 8, 6, 1, 9, 7, 6],
-  [10, 7, 7, 6, 6, 10, 10, 1, 1, 7],
-  [10, 7, 7, 6, 6, 10, 1, 7, 10, 1, 1, 8],
-  [7, 0, 7, 10, 10, 0, 10, 9, 6, 10, 7, 6],
-  [7, 6, 6, 10, 10, 7, 10, 8, 10, 9],
-  [6, 8, 4, 6, 6, 11],
-  [3, 6, 6, 11, 0, 6, 4, 6],
-  [8, 6, 6, 11, 4, 6, 1, 9],
-  [4, 6, 6, 9, 6, 3, 3, 9, 1, 9, 6, 11],
-  [6, 8, 4, 6, 6, 11, 2, 10, 10, 1],
-  [2, 10, 10, 1, 0, 11, 0, 6, 6, 11, 4, 6],
-  [4, 11, 4, 6, 6, 11, 2, 9, 2, 10, 10, 9],
-  [10, 9, 9, 3, 3, 10, 2, 10, 4, 3, 3, 6, 6, 11, 4, 6],
-  [8, 2, 4, 2, 4, 6, 6, 2],
-  [4, 2, 4, 6, 6, 2],
-  [1, 9, 3, 4, 4, 2, 4, 6, 6, 2],
-  [1, 9, 4, 1, 4, 2, 4, 6, 6, 2],
-  [8, 1, 8, 6, 6, 1, 4, 6, 6, 10, 10, 1],
-  [10, 1, 0, 10, 0, 6, 6, 10, 4, 6],
-  [4, 6, 6, 3, 3, 4, 6, 10, 10, 3, 3, 9, 10, 9],
-  [10, 9, 4, 10, 6, 10, 4, 6],
-  [9, 5, 5, 4, 7, 6, 6, 11],
-  [9, 5, 5, 4, 7, 6, 6, 11],
-  [5, 0, 1, 5, 5, 4, 7, 6, 6, 11],
-  [7, 6, 6, 11, 3, 4, 3, 5, 5, 4, 1, 5],
-  [9, 5, 5, 4, 10, 1, 2, 10, 7, 6, 6, 11],
-  [6, 11, 7, 6, 2, 10, 10, 1, 9, 5, 5, 4],
-  [7, 6, 6, 11, 5, 4, 4, 10, 10, 5, 4, 2, 2, 10],
-  [3, 4, 3, 5, 5, 4, 2, 5, 10, 5, 2, 10, 7, 6, 6, 11],
-  [7, 2, 7, 6, 6, 2, 5, 4, 9, 5],
-  [9, 5, 5, 4, 8, 6, 6, 0, 6, 2, 7, 6],
-  [3, 6, 6, 2, 7, 6, 1, 5, 5, 0, 5, 4],
-  [6, 2, 2, 8, 8, 6, 7, 6, 1, 8, 8, 5, 5, 4, 1, 5],
-  [9, 5, 5, 4, 10, 1, 1, 6, 6, 10, 1, 7, 7, 6],
-  [1, 6, 6, 10, 10, 1, 1, 7, 7, 6, 0, 7, 9, 5, 5, 4],
-  [0, 10, 10, 4, 10, 5, 5, 4, 3, 10, 6, 10, 10, 7, 7, 6],
-  [7, 6, 6, 10, 10, 7, 10, 8, 5, 4, 4, 10, 10, 5],
-  [6, 9, 9, 5, 5, 6, 6, 11, 11, 9],
-  [3, 6, 6, 11, 0, 6, 0, 5, 5, 6, 9, 5],
-  [0, 11, 0, 5, 5, 11, 1, 5, 5, 6, 6, 11],
-  [6, 11, 3, 6, 3, 5, 5, 6, 1, 5],
-  [2, 10, 10, 1, 9, 5, 5, 11, 11, 9, 5, 6, 6, 11],
-  [0, 11, 0, 6, 6, 11, 9, 6, 5, 6, 9, 5, 2, 10, 10, 1],
-  [8, 5, 5, 11, 5, 6, 6, 11, 0, 5, 10, 5, 5, 2, 2, 10],
-  [6, 11, 3, 6, 3, 5, 5, 6, 2, 10, 10, 3, 10, 5],
-  [5, 8, 9, 5, 5, 2, 2, 8, 5, 6, 6, 2],
-  [9, 5, 5, 6, 6, 9, 6, 0, 6, 2],
-  [1, 5, 5, 8, 8, 1, 5, 6, 6, 8, 8, 2, 6, 2],
-  [1, 5, 5, 6, 6, 1, 6, 2],
-  [3, 6, 6, 1, 6, 10, 10, 1, 8, 6, 5, 6, 6, 9, 9, 5],
-  [10, 1, 0, 10, 0, 6, 6, 10, 9, 5, 5, 0, 5, 6],
-  [5, 6, 6, 10, 10, 5],
-  [10, 5, 5, 6, 6, 10],
-  [11, 5, 5, 10, 10, 11, 7, 5],
-  [11, 5, 5, 10, 10, 11, 7, 5],
-  [5, 11, 7, 5, 5, 10, 10, 11, 1, 9],
-  [10, 7, 7, 5, 5, 10, 10, 11, 8, 1, 1, 9],
-  [11, 1, 2, 11, 7, 1, 7, 5, 5, 1],
-  [2, 7, 7, 1, 7, 5, 5, 1, 2, 11],
-  [9, 7, 7, 5, 5, 9, 9, 2, 2, 7, 2, 11],
-  [7, 5, 5, 2, 2, 7, 2, 11, 5, 9, 9, 2, 2, 8],
-  [2, 5, 5, 10, 10, 2, 3, 5, 7, 5],
-  [8, 2, 8, 5, 5, 2, 7, 5, 10, 2, 5, 10],
-  [1, 9, 5, 10, 10, 3, 3, 5, 7, 5, 10, 2],
-  [8, 2, 2, 9, 1, 9, 7, 2, 10, 2, 2, 5, 5, 10, 7, 5],
-  [3, 5, 5, 1, 7, 5],
-  [7, 0, 7, 1, 7, 5, 5, 1],
-  [3, 9, 3, 5, 5, 9, 7, 5],
-  [7, 9, 5, 9, 7, 5],
-  [5, 8, 4, 5, 5, 10, 10, 8, 10, 11],
-  [5, 0, 4, 5, 5, 11, 11, 0, 5, 10, 10, 11],
-  [1, 9, 4, 10, 10, 8, 10, 11, 4, 5, 5, 10],
-  [10, 11, 11, 4, 4, 10, 4, 5, 5, 10, 3, 4, 4, 1, 1, 9],
-  [2, 5, 5, 1, 2, 8, 8, 5, 2, 11, 4, 5],
-  [4, 11, 11, 0, 4, 5, 5, 11, 2, 11, 11, 1, 5, 1],
-  [2, 5, 5, 0, 5, 9, 2, 11, 11, 5, 4, 5, 5, 8],
-  [4, 5, 5, 9, 2, 11],
-  [2, 5, 5, 10, 10, 2, 3, 5, 3, 4, 4, 5],
-  [5, 10, 10, 2, 2, 5, 2, 4, 4, 5],
-  [3, 10, 10, 2, 3, 5, 5, 10, 8, 5, 4, 5, 1, 9],
-  [5, 10, 10, 2, 2, 5, 2, 4, 4, 5, 1, 9, 9, 2],
-  [4, 5, 5, 8, 5, 3, 5, 1],
-  [4, 5, 5, 0, 5, 1],
-  [4, 5, 5, 8, 5, 3, 0, 5, 5, 9],
-  [4, 5, 5, 9],
-  [4, 11, 7, 4, 9, 11, 9, 10, 10, 11],
-  [9, 7, 7, 4, 9, 11, 9, 10, 10, 11],
-  [1, 10, 10, 11, 11, 1, 11, 4, 4, 1, 7, 4],
-  [1, 4, 4, 3, 1, 10, 10, 4, 7, 4, 4, 11, 10, 11],
-  [4, 11, 7, 4, 9, 11, 9, 2, 2, 11, 9, 1],
-  [9, 7, 7, 4, 9, 11, 9, 1, 1, 11, 2, 11],
-  [7, 4, 4, 11, 4, 2, 2, 11],
-  [7, 4, 4, 11, 4, 2, 2, 11, 3, 4],
-  [2, 9, 9, 10, 10, 2, 2, 7, 7, 9, 7, 4],
-  [9, 10, 10, 7, 7, 9, 7, 4, 10, 2, 2, 7, 7, 0],
-  [7, 10, 10, 3, 10, 2, 7, 4, 4, 10, 1, 10, 10, 0],
-  [1, 10, 10, 2, 7, 4],
-  [9, 1, 1, 4, 1, 7, 7, 4],
-  [9, 1, 1, 4, 1, 7, 7, 4, 8, 1],
-  [3, 4, 7, 4],
-  [7, 4],
-  [9, 10, 10, 8, 10, 11],
-  [9, 3, 9, 11, 9, 10, 10, 11],
-  [1, 10, 10, 0, 10, 8, 10, 11],
-  [1, 10, 10, 3, 10, 11],
-  [2, 11, 11, 1, 11, 9, 9, 1],
-  [9, 3, 9, 11, 2, 9, 9, 1, 2, 11],
-  [2, 11, 11, 0],
-  [2, 11],
-  [8, 2, 8, 10, 10, 2, 9, 10],
-  [9, 10, 10, 2, 2, 9],
-  [8, 2, 8, 10, 10, 2, 1, 8, 1, 10],
-  [1, 10, 10, 2],
-  [8, 1, 9, 1],
-  [9, 1],
-  [],
-  []];
-
-const segTable2 = [
-  [],
-  [],
-  [1, 9],
-  [1, 9],
-  [2, 10, 10, 1],
-  [2, 10, 10, 1],
-  [2, 10, 10, 9],
-  [2, 10, 10, 9],
-  [11, 2],
-  [11, 2],
-  [1, 9, 11, 2],
-  [11, 2, 1, 9],
-  [10, 1, 11, 10],
-  [10, 1, 11, 10],
-  [11, 10, 10, 9],
-  [10, 9, 11, 10],
-  [4, 7],
-  [4, 7],
-  [1, 9, 4, 7],
-  [1, 9, 4, 7],
-  [2, 10, 10, 1, 4, 7],
-  [4, 7, 2, 10, 10, 1],
-  [2, 10, 10, 9, 4, 7],
-  [2, 10, 10, 9, 4, 7],
-  [4, 7, 11, 2],
-  [4, 7, 11, 2],
-  [1, 9, 4, 7, 11, 2],
-  [4, 7, 11, 2, 1, 9],
-  [10, 1, 11, 10, 4, 7],
-  [11, 10, 10, 1, 4, 7],
-  [4, 7, 11, 10, 10, 9],
-  [4, 7, 11, 10, 10, 9],
-  [9, 5, 5, 4],
-  [9, 5, 5, 4],
-  [5, 4, 1, 5],
-  [5, 4, 1, 5],
-  [2, 10, 10, 1, 9, 5, 5, 4],
-  [2, 10, 10, 1, 9, 5, 5, 4],
-  [2, 10, 10, 5, 5, 4],
-  [2, 10, 10, 5, 5, 4],
-  [9, 5, 5, 4, 11, 2],
-  [11, 2, 9, 5, 5, 4],
-  [5, 4, 1, 5, 11, 2],
-  [1, 5, 11, 2, 5, 4],
-  [11, 10, 10, 1, 9, 5, 5, 4],
-  [9, 5, 5, 4, 10, 1, 11, 10],
-  [5, 4, 11, 10, 10, 5],
-  [5, 4, 10, 5, 11, 10],
-  [5, 7, 9, 5],
-  [9, 5, 5, 7],
-  [1, 5, 5, 7],
-  [1, 5, 5, 7],
-  [9, 5, 5, 7, 10, 1, 2, 10],
-  [10, 1, 2, 10, 9, 5, 5, 7],
-  [5, 7, 10, 5, 2, 10],
-  [2, 10, 10, 5, 5, 7],
-  [9, 5, 5, 7, 11, 2],
-  [9, 5, 5, 7, 11, 2],
-  [11, 2, 1, 5, 5, 7],
-  [11, 2, 1, 5, 5, 7],
-  [9, 5, 5, 7, 10, 1, 11, 10],
-  [5, 7, 9, 5, 10, 1, 11, 10],
-  [11, 10, 10, 5, 5, 7],
-  [11, 10, 10, 5, 5, 7],
-  [10, 6, 6, 5, 5, 10],
-  [5, 10, 10, 6, 6, 5],
-  [1, 9, 5, 10, 10, 6, 6, 5],
-  [1, 9, 5, 10, 10, 6, 6, 5],
-  [6, 5, 5, 1, 2, 6],
-  [6, 5, 5, 1, 2, 6],
-  [6, 5, 5, 9, 2, 6],
-  [5, 9, 2, 6, 6, 5],
-  [11, 2, 10, 6, 6, 5, 5, 10],
-  [11, 2, 10, 6, 6, 5, 5, 10],
-  [1, 9, 11, 2, 5, 10, 10, 6, 6, 5],
-  [5, 10, 10, 6, 6, 5, 1, 9, 11, 2],
-  [11, 6, 6, 5, 5, 1],
-  [5, 1, 11, 6, 6, 5],
-  [11, 6, 6, 5, 5, 9],
-  [6, 5, 5, 9, 11, 6],
-  [5, 10, 10, 6, 6, 5, 4, 7],
-  [4, 7, 6, 5, 5, 10, 10, 6],
-  [1, 9, 5, 10, 10, 6, 6, 5, 4, 7],
-  [10, 6, 6, 5, 5, 10, 1, 9, 4, 7],
-  [2, 6, 6, 5, 5, 1, 4, 7],
-  [5, 1, 2, 6, 6, 5, 4, 7],
-  [4, 7, 5, 9, 6, 5, 2, 6],
-  [4, 7, 5, 9, 6, 5, 2, 6],
-  [11, 2, 4, 7, 10, 6, 6, 5, 5, 10],
-  [5, 10, 10, 6, 6, 5, 4, 7, 11, 2],
-  [1, 9, 4, 7, 11, 2, 5, 10, 10, 6, 6, 5],
-  [1, 9, 11, 2, 4, 7, 5, 10, 10, 6, 6, 5],
-  [4, 7, 5, 1, 11, 6, 6, 5],
-  [5, 1, 11, 6, 6, 5, 4, 7],
-  [5, 9, 6, 5, 11, 6, 4, 7],
-  [6, 5, 5, 9, 11, 6, 4, 7],
-  [9, 10, 6, 4, 10, 6],
-  [10, 6, 6, 4, 9, 10],
-  [1, 10, 10, 6, 6, 4],
-  [6, 4, 1, 10, 10, 6],
-  [9, 1, 2, 6, 6, 4],
-  [9, 1, 2, 6, 6, 4],
-  [2, 6, 6, 4],
-  [2, 6, 6, 4],
-  [9, 10, 10, 6, 6, 4, 11, 2],
-  [11, 2, 9, 10, 10, 6, 6, 4],
-  [11, 2, 6, 4, 1, 10, 10, 6],
-  [6, 4, 1, 10, 10, 6, 11, 2],
-  [6, 4, 9, 1, 11, 6],
-  [11, 6, 9, 1, 6, 4],
-  [11, 6, 6, 4],
-  [6, 4, 11, 6],
-  [10, 6, 6, 7, 9, 10],
-  [9, 10, 6, 7, 10, 6],
-  [10, 6, 6, 7, 1, 10],
-  [10, 6, 6, 7, 1, 10],
-  [2, 6, 9, 1, 6, 7],
-  [2, 6, 9, 1, 6, 7],
-  [6, 7, 2, 6],
-  [6, 7, 2, 6],
-  [11, 2, 10, 6, 9, 10, 6, 7],
-  [11, 2, 6, 7, 10, 6, 9, 10],
-  [1, 10, 6, 7, 10, 6, 11, 2],
-  [11, 2, 10, 6, 1, 10, 6, 7],
-  [6, 7, 9, 1, 11, 6],
-  [9, 1, 11, 6, 6, 7],
-  [6, 7, 11, 6],
-  [11, 6, 6, 7],
-  [7, 6, 6, 11],
-  [7, 6, 6, 11],
-  [1, 9, 7, 6, 6, 11],
-  [1, 9, 7, 6, 6, 11],
-  [10, 1, 2, 10, 6, 11, 7, 6],
-  [2, 10, 10, 1, 6, 11, 7, 6],
-  [2, 10, 10, 9, 6, 11, 7, 6],
-  [6, 11, 7, 6, 2, 10, 10, 9],
-  [6, 2, 7, 6],
-  [7, 6, 6, 2],
-  [7, 6, 6, 2, 1, 9],
-  [6, 2, 1, 9, 7, 6],
-  [7, 6, 6, 10, 10, 1],
-  [7, 6, 6, 10, 10, 1],
-  [10, 9, 6, 10, 7, 6],
-  [7, 6, 6, 10, 10, 9],
-  [4, 6, 6, 11],
-  [6, 11, 4, 6],
-  [6, 11, 4, 6, 1, 9],
-  [4, 6, 1, 9, 6, 11],
-  [4, 6, 6, 11, 2, 10, 10, 1],
-  [2, 10, 10, 1, 6, 11, 4, 6],
-  [4, 6, 6, 11, 2, 10, 10, 9],
-  [10, 9, 2, 10, 6, 11, 4, 6],
-  [4, 6, 6, 2],
-  [4, 6, 6, 2],
-  [1, 9, 4, 6, 6, 2],
-  [1, 9, 4, 6, 6, 2],
-  [4, 6, 6, 10, 10, 1],
-  [10, 1, 6, 10, 4, 6],
-  [4, 6, 6, 10, 10, 9],
-  [10, 9, 6, 10, 4, 6],
-  [9, 5, 5, 4, 7, 6, 6, 11],
-  [9, 5, 5, 4, 7, 6, 6, 11],
-  [1, 5, 5, 4, 7, 6, 6, 11],
-  [7, 6, 6, 11, 5, 4, 1, 5],
-  [9, 5, 5, 4, 10, 1, 2, 10, 7, 6, 6, 11],
-  [6, 11, 7, 6, 2, 10, 10, 1, 9, 5, 5, 4],
-  [7, 6, 6, 11, 5, 4, 10, 5, 2, 10],
-  [5, 4, 10, 5, 2, 10, 7, 6, 6, 11],
-  [7, 6, 6, 2, 5, 4, 9, 5],
-  [9, 5, 5, 4, 6, 2, 7, 6],
-  [6, 2, 7, 6, 1, 5, 5, 4],
-  [6, 2, 7, 6, 5, 4, 1, 5],
-  [9, 5, 5, 4, 10, 1, 6, 10, 7, 6],
-  [6, 10, 10, 1, 7, 6, 9, 5, 5, 4],
-  [10, 5, 5, 4, 6, 10, 7, 6],
-  [7, 6, 6, 10, 5, 4, 10, 5],
-  [9, 5, 5, 6, 6, 11],
-  [6, 11, 5, 6, 9, 5],
-  [1, 5, 5, 6, 6, 11],
-  [6, 11, 5, 6, 1, 5],
-  [2, 10, 10, 1, 9, 5, 5, 6, 6, 11],
-  [6, 11, 5, 6, 9, 5, 2, 10, 10, 1],
-  [5, 6, 6, 11, 10, 5, 2, 10],
-  [6, 11, 5, 6, 2, 10, 10, 5],
-  [9, 5, 5, 6, 6, 2],
-  [9, 5, 5, 6, 6, 2],
-  [1, 5, 5, 6, 6, 2],
-  [1, 5, 5, 6, 6, 2],
-  [6, 10, 10, 1, 5, 6, 9, 5],
-  [10, 1, 6, 10, 9, 5, 5, 6],
-  [5, 6, 6, 10, 10, 5],
-  [10, 5, 5, 6, 6, 10],
-  [5, 10, 10, 11, 7, 5],
-  [5, 10, 10, 11, 7, 5],
-  [7, 5, 5, 10, 10, 11, 1, 9],
-  [7, 5, 5, 10, 10, 11, 1, 9],
-  [2, 11, 7, 5, 5, 1],
-  [7, 5, 5, 1, 2, 11],
-  [7, 5, 5, 9, 2, 11],
-  [7, 5, 2, 11, 5, 9],
-  [5, 10, 10, 2, 7, 5],
-  [7, 5, 10, 2, 5, 10],
-  [1, 9, 5, 10, 7, 5, 10, 2],
-  [1, 9, 10, 2, 5, 10, 7, 5],
-  [5, 1, 7, 5],
-  [7, 5, 5, 1],
-  [5, 9, 7, 5],
-  [5, 9, 7, 5],
-  [4, 5, 5, 10, 10, 11],
-  [4, 5, 5, 10, 10, 11],
-  [1, 9, 10, 11, 4, 5, 5, 10],
-  [10, 11, 4, 5, 5, 10, 1, 9],
-  [5, 1, 2, 11, 4, 5],
-  [4, 5, 2, 11, 5, 1],
-  [5, 9, 2, 11, 4, 5],
-  [4, 5, 5, 9, 2, 11],
-  [5, 10, 10, 2, 4, 5],
-  [5, 10, 10, 2, 4, 5],
-  [10, 2, 5, 10, 4, 5, 1, 9],
-  [5, 10, 10, 2, 4, 5, 1, 9],
-  [4, 5, 5, 1],
-  [4, 5, 5, 1],
-  [4, 5, 5, 9],
-  [4, 5, 5, 9],
-  [7, 4, 9, 10, 10, 11],
-  [7, 4, 9, 10, 10, 11],
-  [1, 10, 10, 11, 7, 4],
-  [1, 10, 7, 4, 10, 11],
-  [7, 4, 2, 11, 9, 1],
-  [7, 4, 9, 1, 2, 11],
-  [7, 4, 2, 11],
-  [7, 4, 2, 11],
-  [9, 10, 10, 2, 7, 4],
-  [9, 10, 7, 4, 10, 2],
-  [10, 2, 7, 4, 1, 10],
-  [1, 10, 10, 2, 7, 4],
-  [9, 1, 7, 4],
-  [9, 1, 7, 4],
-  [7, 4],
-  [7, 4],
-  [9, 10, 10, 11],
-  [9, 10, 10, 11],
-  [1, 10, 10, 11],
-  [1, 10, 10, 11],
-  [2, 11, 9, 1],
-  [9, 1, 2, 11],
-  [2, 11],
-  [2, 11],
-  [10, 2, 9, 10],
-  [9, 10, 10, 2],
-  [10, 2, 1, 10],
-  [1, 10, 10, 2],
-  [9, 1],
-  [9, 1],
-  [],
-  []];
-
-const cubeVerts = [[0,0,0], [1,0,0], [1,1,0], [0,1,0],
-                   [0,0,1], [1,0,1], [1,1,1], [0,1,1]];
-const edgeIndex = [[0,1], [1,2], [2,3], [3,0], [4,5], [5,6],
-                   [6,7], [7,4], [0,4], [1,5], [2,6], [3,7]];
-// edge directions: [x, y, -x, -y, x, y, -x, -y, z, z, z, z]
-
-// return offsets relative to vertex [0,0,0]
-function calculateVertOffsets(dims) {
-  const vert_offsets = [];
-  for (let i = 0; i < 8; ++i) {
-    const v = cubeVerts[i];
-    vert_offsets.push(v[0] + dims[2] * (v[1] + dims[1] * v[2]));
-  }
-  return vert_offsets;
-}
-
-
-function marchingCubes(dims,
-                       values,
-                       points,
-                       isolevel,
-                       method) {
-  const snap = (method === 'snapped MC');
-  const seg_table = (method === 'squarish' ? segTable2 : segTable);
-  const vlist = new Array(12);
-  const vert_offsets = calculateVertOffsets(dims);
-  const vertex_values = new Float32Array(8);
-  const vertex_points = new Array(8);
-  const size_x = dims[0];
-  const size_y = dims[1];
-  const size_z = dims[2];
-  if (values == null || points == null) return;
-  const vertices = [];
-  const segments = [];
-  let vertex_count = 0;
-  for (let x = 0; x < size_x - 1; x++) {
-    for (let y = 0; y < size_y - 1; y++) {
-      for (let z = 0; z < size_z - 1; z++) {
-        const offset0 = z + size_z * (y + size_y * x);
-        let cubeindex = 0;
-        let i;
-        let j;
-        for (i = 0; i < 8; ++i) {
-          j = offset0 + vert_offsets[i];
-          cubeindex |= (values[j] < isolevel) ? 1 << i : 0;
-        }
-        if (cubeindex === 0 || cubeindex === 255) continue;
-        for (i = 0; i < 8; ++i) {
-          j = offset0 + vert_offsets[i];
-          vertex_values[i] = values[j];
-          vertex_points[i] = points[j];
-        }
-
-        // 12 bit number, indicates which edges are crossed by the isosurface
-        const edge_mask = edgeTable[cubeindex];
-
-        // check which edges are crossed, and estimate the point location
-        // using a weighted average of scalar values at edge endpoints.
-        for (i = 0; i < 12; ++i) {
-          if ((edge_mask & (1 << i)) !== 0) {
-            const e = edgeIndex[i];
-            let mu = (isolevel - vertex_values[e[0]]) /
-                     (vertex_values[e[1]] - vertex_values[e[0]]);
-            if (snap === true) {
-              if (mu > 0.85) mu = 1;
-              else if (mu < 0.15) mu = 0;
-            }
-            const p1 = vertex_points[e[0]];
-            const p2 = vertex_points[e[1]];
-            // The number of added vertices could be roughly halved
-            // if we avoided duplicates between neighbouring cells.
-            // Using a map for lookups is too slow, perhaps a big
-            // array would do?
-            vertices.push(p1[0] + (p2[0] - p1[0]) * mu,
-                          p1[1] + (p2[1] - p1[1]) * mu,
-                          p1[2] + (p2[2] - p1[2]) * mu);
-            vlist[i] = vertex_count++;
-          }
-        }
-        const t = seg_table[cubeindex];
-        for (i = 0; i < t.length; i++) {
-          segments.push(vlist[t[i]]);
-        }
-      }
-    }
-  }
-  return { vertices: vertices, segments: segments };
-}
-
 function modulo(a, b) {
   const reminder = a % b;
   return reminder >= 0 ? reminder : reminder + b;
@@ -1331,17 +575,99 @@ class GridArray {
   }
 }
 
-function calculate_stddev(a, offset) {
-  let sum = 0;
-  let sq_sum = 0;
-  const alen = a.length;
-  for (let i = offset; i < alen; i++) {
-    sum += a[i];
-    sq_sum += a[i] * a[i];
+class Block {
+  
+  
+  
+
+  constructor() {
+    this._points = null;
+    this._values = null;
+    this._size = [0, 0, 0];
   }
-  const mean = sum / (alen - offset);
-  const variance = sq_sum / (alen - offset) - mean * mean;
-  return {mean: mean, rms: Math.sqrt(variance)};
+
+  set(points, values, size) {
+    if (size[0] <= 0 || size[1] <= 0 || size[2] <= 0) {
+      throw Error('Grid dimensions are zero along at least one edge');
+    }
+    const len = size[0] * size[1] * size[2];
+    if (values.length !== len || points.length !== len) {
+      throw Error('isosurface: array size mismatch');
+    }
+
+    this._points = new Float32Array(3 * len);
+    for (let i = 0; i < len; ++i) {
+      const point = points[i];
+      this._points[3*i] = point[0];
+      this._points[3*i+1] = point[1];
+      this._points[3*i+2] = point[2];
+    }
+    this._values = new Float32Array(values);
+    this._size = size;
+  }
+
+  clear() {
+    this._points = null;
+    this._values = null;
+  }
+
+  empty()  {
+    return this._values === null;
+  }
+
+  isosurface(gemmi_module, isolevel, method='') {
+    if (gemmi_module == null) {
+      throw Error('Gemmi is required for isosurface extraction.');
+    }
+    if (this._values == null || this._points == null) {
+      throw Error('Block is empty.');
+    }
+
+    let iso = null;
+    try {
+      iso = new gemmi_module.Isosurface();
+      iso.resize_input(this._values.length);
+      iso.set_size(this._size[0], this._size[1], this._size[2]);
+      iso.input_points().set(this._points);
+      iso.input_values().set(this._values);
+      if (!iso.calculate(isolevel, method)) {
+        throw Error(iso.last_error || 'Failed to calculate isosurface.');
+      }
+      return {
+        vertices: iso.vertices().slice(),
+        segments: iso.segments().slice(),
+      };
+    } finally {
+      if (iso != null) iso.delete();
+    }
+  }
+}
+
+function extract_block_from_grid(block, grid, unit_cell,
+                                 radius, center) {
+  const fc = unit_cell.fractionalize(center);
+  const r = [radius / unit_cell.a,
+             radius / unit_cell.b,
+             radius / unit_cell.c];
+  const grid_min = grid.frac2grid([fc[0] - r[0], fc[1] - r[1], fc[2] - r[2]]);
+  const grid_max = grid.frac2grid([fc[0] + r[0], fc[1] + r[1], fc[2] + r[2]]);
+  const size = [grid_max[0] - grid_min[0] + 1,
+                      grid_max[1] - grid_min[1] + 1,
+                      grid_max[2] - grid_min[2] + 1];
+  const points = [];
+  const values = [];
+  for (let i = grid_min[0]; i <= grid_max[0]; i++) {
+    for (let j = grid_min[1]; j <= grid_max[1]; j++) {
+      for (let k = grid_min[2]; k <= grid_max[2]; k++) {
+        const frac = grid.grid2frac(i, j, k);
+        const orth = unit_cell.orthogonalize(frac);
+        points.push(orth);
+        const map_value = grid.get_grid_value(i, j, k);
+        values.push(map_value);
+      }
+    }
+  }
+  block.set(points, values, size);
 }
 
 class ElMap {
@@ -1350,13 +676,21 @@ class ElMap {
   
   
   
+  
+  
+  
+  
    // used in ReciprocalSpaceMap
 
   constructor() {
+    this.gemmi_module = null;
     this.unit_cell = null;
     this.grid = null;
     this.stats = { mean: 0.0, rms: 1.0 };
     this.block = new Block();
+    this.wasm_map = null;
+    this.block_center = null;
+    this.block_radius = 0;
   }
 
   abs_level(sigma) {
@@ -1368,142 +702,76 @@ class ElMap {
     if (gemmi == null || typeof gemmi.readCcp4Map !== 'function') {
       throw Error('Gemmi is required for CCP4 map loading.');
     }
-    const ccp4 = gemmi.readCcp4Map(buf, expand_symmetry);
-    try {
-      this.set_from_ccp4_map(ccp4);
-    } finally {
-      ccp4.delete();
+    this.gemmi_module = gemmi;
+    if (this.wasm_map != null) {
+      this.wasm_map.delete();
+      this.wasm_map = null;
     }
+    const ccp4 = gemmi.readCcp4Map(buf, expand_symmetry);
+    this.wasm_map = ccp4;
+    this.set_from_wasm_map(ccp4, gemmi);
   }
 
   // DSN6 MAP FORMAT
   // http://www.uoxray.uoregon.edu/tnt/manual/node104.html
   // Density values are stored as bytes.
-  from_dsn6(buf) {
-    //console.log('buf type: ' + Object.prototype.toString.call(buf));
-    const u8data = new Uint8Array(buf);
-    const iview = new Int16Array(u8data.buffer);
-    if (iview[18] !== 100) {
-      const len = iview.length;  // or only header, 256?
-      for (let n = 0; n < len; n++) {
-        // swapping bytes with Uint8Array like this:
-        // var tmp=u8data[n*2]; u8data[n*2]=u8data[n*2+1]; u8data[n*2+1]=tmp;
-        // was slowing down this whole function 5x times (!?) on V8.
-        const val = iview[n];
-        iview[n] = ((val & 0xff) << 8) | ((val >> 8) & 0xff);
-      }
+  from_dsn6(buf, gemmi) {
+    if (typeof gemmi.readDsn6Map !== 'function') {
+      throw Error('Gemmi is required for DSN6 map loading.');
     }
-    if (iview[18] !== 100) {
-      throw Error('Endian swap failed');
+    this.gemmi_module = gemmi;
+    if (this.wasm_map != null) {
+      this.wasm_map.delete();
+      this.wasm_map = null;
     }
-    const origin = [iview[0], iview[1], iview[2]];
-    const n_real = [iview[3], iview[4], iview[5]];
-    const n_grid = [iview[6], iview[7], iview[8]];
-    const cell_mult = 1.0 / iview[17];
-    this.unit_cell = new UnitCell(cell_mult * iview[9],
-                                  cell_mult * iview[10],
-                                  cell_mult * iview[11],
-                                  cell_mult * iview[12],
-                                  cell_mult * iview[13],
-                                  cell_mult * iview[14]);
-    const grid = new GridArray(n_grid);
-    const prod = iview[15] / 100;
-    const plus = iview[16];
-    //var data_scale_factor = iview[15] / iview[18] + iview[16];
-    // bricks have 512 (8x8x8) values
-    let offset = 512;
-    const n_blocks = [Math.ceil(n_real[0] / 8),
-                      Math.ceil(n_real[1] / 8),
-                      Math.ceil(n_real[2] / 8)];
-    for (let zz = 0; zz < n_blocks[2]; zz++) {
-      for (let yy = 0; yy < n_blocks[1]; yy++) {
-        for (let xx = 0; xx < n_blocks[0]; xx++) { // loop over bricks
-          for (let k = 0; k < 8; k++) {
-            const z = 8 * zz + k;
-            for (let j = 0; j < 8; j++) {
-              const y = 8 * yy + j;
-              for (let i = 0; i < 8; i++) { // loop inside brick
-                const x = 8 * xx + i;
-                if (x < n_real[0] && y < n_real[1] && z < n_real[2]) {
-                  const density = (u8data[offset] - plus) / prod;
-                  offset++;
-                  grid.set_grid_value(origin[0] + x,
-                                      origin[1] + y,
-                                      origin[2] + z, density);
-                } else {
-                  offset += 8 - i;
-                  break;
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-    this.stats = calculate_stddev(grid.values, 0);
-    this.grid = grid;
-    //this.show_debug_info();
+    const dsn6 = gemmi.readDsn6Map(buf);
+    this.wasm_map = dsn6;
+    this.set_from_wasm_map(dsn6, gemmi);
   }
 
-  show_debug_info() {
-    console.log('unit cell:', this.unit_cell && this.unit_cell.parameters);
-    console.log('grid:', this.grid && this.grid.dim);
-  }
-
-  // Extract a block of density for calculating an isosurface using the
-  // separate marching cubes implementation.
-  extract_block(radius, center) {
+  prepare_isosurface(radius, center) {
+    this.block_center = center;
+    this.block_radius = radius;
+    if (this.wasm_map != null && this.unit_cell != null) return;
     const grid = this.grid;
     const unit_cell = this.unit_cell;
     if (grid == null || unit_cell == null) return;
-    const fc = unit_cell.fractionalize(center);
-    const r = [radius / unit_cell.parameters[0],
-               radius / unit_cell.parameters[1],
-               radius / unit_cell.parameters[2]];
-    const grid_min = grid.frac2grid([fc[0] - r[0], fc[1] - r[1], fc[2] - r[2]]);
-    const grid_max = grid.frac2grid([fc[0] + r[0], fc[1] + r[1], fc[2] + r[2]]);
-    const size = [grid_max[0] - grid_min[0] + 1,
-                        grid_max[1] - grid_min[1] + 1,
-                        grid_max[2] - grid_min[2] + 1];
-    const points = [];
-    const values = [];
-    for (let i = grid_min[0]; i <= grid_max[0]; i++) {
-      for (let j = grid_min[1]; j <= grid_max[1]; j++) {
-        for (let k = grid_min[2]; k <= grid_max[2]; k++) {
-          const frac = grid.grid2frac(i, j, k);
-          const orth = unit_cell.orthogonalize(frac);
-          points.push(orth);
-          const map_value = grid.get_grid_value(i, j, k);
-          values.push(map_value);
-        }
-      }
-    }
-    this.block.set(points, values, size);
+    extract_block_from_grid(this.block, grid, unit_cell, radius, center);
   }
 
   isomesh_in_block(sigma, method) {
     const abs_level = this.abs_level(sigma);
-    return this.block.isosurface(abs_level, method);
+    if (this.wasm_map != null && this.block_center != null && this.unit_cell != null) {
+      if (!this.wasm_map.extract_isosurface(this.block_radius,
+                                            this.block_center[0],
+                                            this.block_center[1],
+                                            this.block_center[2],
+                                            abs_level,
+                                            method || '')) {
+        throw Error(this.wasm_map.last_error || 'Failed to extract isosurface.');
+      }
+      return {
+        vertices: this.wasm_map.isosurface_vertices().slice(),
+        segments: this.wasm_map.isosurface_segments().slice(),
+      } ;
+    }
+    return this.block.isosurface(this.gemmi_module, abs_level, method);
   }
 
-   set_from_ccp4_map(ccp4) {
-    const cell = ccp4.cell;
-    this.unit_cell = new UnitCell(cell.a, cell.b, cell.c,
-                                  cell.alpha, cell.beta, cell.gamma);
-    this.stats.mean = ccp4.mean;
-    this.stats.rms = ccp4.rms;
-    const dim = [ccp4.nx, ccp4.ny, ccp4.nz];
-    const grid = new GridArray(dim);
-    const values = ccp4.data();
-    for (let x = 0; x < dim[0]; ++x) {
-      for (let y = 0; y < dim[1]; ++y) {
-        for (let z = 0; z < dim[2]; ++z) {
-          const src = (z * dim[1] + y) * dim[0] + x;
-          grid.values[grid.grid2index_unchecked(x, y, z)] = values[src];
-        }
-      }
+  dispose() {
+    if (this.wasm_map != null) {
+      this.wasm_map.delete();
+      this.wasm_map = null;
     }
-    this.grid = grid;
+  }
+
+   set_from_wasm_map(map, gemmi) {
+    const cell = map.cell;
+    this.unit_cell = new gemmi.UnitCell(cell.a, cell.b, cell.c,
+                                        cell.alpha, cell.beta, cell.gamma);
+    this.stats.mean = map.mean;
+    this.stats.rms = map.rms;
+    this.grid = null;
   }
 
 }
@@ -1700,7 +968,6 @@ class Quaternion {
 
 class Vector3 {
   constructor(x = 0, y = 0, z = 0) {
-    Vector3.prototype.isVector3 = true;
     this.x = x;
     this.y = y;
     this.z = z;
@@ -1898,6 +1165,7 @@ class Vector3 {
     return this;
   }
 }
+Vector3.prototype.isVector3 = true;
 const _vector = /*@__PURE__*/ new Vector3();
 
 
@@ -3056,7 +2324,6 @@ let _materialId = 0;
 class Material extends EventDispatcher {
   constructor() {
     super();
-    this.isMaterial = true;
     Object.defineProperty(this, 'id', { value: _materialId++ });
     this.uuid = generateUUID();
     this.name = '';
@@ -3123,12 +2390,12 @@ class Material extends EventDispatcher {
     this.dispatchEvent( { type: 'update' } );
   }
 }
+Material.prototype.isMaterial = true;
 
 // materials/ShaderMaterial.js
 class ShaderMaterial extends Material {
   constructor(parameters) {
     super();
-    this.isShaderMaterial = true;
     this.type = 'ShaderMaterial';
     this.uniforms = {};
     this.vertexShader = '';
@@ -3143,6 +2410,7 @@ class ShaderMaterial extends Material {
     this.setValues(parameters);
   }
 }
+ShaderMaterial.prototype.isShaderMaterial = true;
 
 
 // core/Object3D.js
@@ -3154,8 +2422,6 @@ const _removedEvent = { type: 'removed' };
 class Object3D extends EventDispatcher {
   constructor() {
     super();
-
-    this.isObject3D = true;
 
     Object.defineProperty(this, 'id', { value: _object3DId++ });
 
@@ -3298,6 +2564,7 @@ class Object3D extends EventDispatcher {
   }
 }
 
+Object3D.prototype.isObject3D = true;
 Object3D.DEFAULT_UP = /*@__PURE__*/ new Vector3(0, 1, 0);
 Object3D.DEFAULT_MATRIX_AUTO_UPDATE = true;
 Object3D.DEFAULT_MATRIX_WORLD_AUTO_UPDATE = true;
@@ -3310,7 +2577,6 @@ class BufferAttribute {
     if (Array.isArray(array)) {
       throw new TypeError('BufferAttribute: array should be a Typed Array.');
     }
-    this.isBufferAttribute = true;
 
     this.array = array;
     this.itemSize = itemSize;
@@ -3332,6 +2598,7 @@ class BufferAttribute {
 
   onUploadCallback() {}
 }
+BufferAttribute.prototype.isBufferAttribute = true;
 
 
 // core/BufferGeometry.js
@@ -3340,7 +2607,6 @@ let _id = 0;
 class BufferGeometry extends EventDispatcher {
   constructor() {
     super();
-    this.isBufferGeometry = true;
     Object.defineProperty(this, 'id', { value: _id++ });
     this.uuid = generateUUID();
     this.name = '';
@@ -3370,15 +2636,13 @@ class BufferGeometry extends EventDispatcher {
     this.dispatchEvent({ type: 'dispose' });
   }
 }
+BufferGeometry.prototype.isBufferGeometry = true;
 
 
 // objects/Mesh.js
 class Mesh extends Object3D {
   constructor(geometry, material) {
     super();
-
-    this.isMesh = true;
-
     this.type = 'Mesh';
 
     if (!geometry) throw new TypeError('Mesh: geometry not set');
@@ -3386,13 +2650,13 @@ class Mesh extends Object3D {
     this.material = material;
   }
 }
+Mesh.prototype.isMesh = true;
 
 
 // cameras/Camera.js
 class Camera extends Object3D {
   constructor() {
     super();
-    this.isCamera = true;
     this.type = 'Camera';
     this.matrixWorldInverse = new Matrix4();
     this.projectionMatrix = new Matrix4();
@@ -3411,6 +2675,7 @@ class Camera extends Object3D {
   //  this.matrixWorldInverse.copy(this.matrixWorld).invert();
   //}
 }
+Camera.prototype.isCamera = true;
 
 // cameras/OrthographicCamera.js
 class OrthographicCamera extends Camera {
@@ -5202,12 +4467,12 @@ class Scene extends Object3D {
 class Line extends Object3D {
   constructor(geometry, material) {
     super();
-    this.isLine = true;
     this.type = 'Line';
     this.geometry = geometry;
     this.material = material;
   }
 }
+Line.prototype.isLine = true;
 
 
 // objects/LineSegments.js
@@ -5224,12 +4489,12 @@ class LineSegments extends Line {
 class Points extends Object3D {
   constructor(geometry, material) {
     super();
-    this.isPoints = true;
     this.type = 'Points';
     this.geometry = geometry;
     this.material = material;
   }
 }
+Points.prototype.isPoints = true;
 
 // Copyright 2010-2023 Three.js Authors
 // SPDX-License-Identifier: MIT
@@ -5327,9 +4592,7 @@ const pz = /*@__PURE__*/ new CubicPoly();
 class CatmullRomCurve3 extends Curve {
   constructor(points = [], closed = false, curveType = 'centripetal', tension = 0.5) {
     super();
-
     this.isCatmullRomCurve3 = true;
-
     this.type = 'CatmullRomCurve3';
 
     this.points = points;
@@ -7481,7 +6744,7 @@ class Viewer {
     if (map_bag.map.block.empty()) {
       const t = this.target;
       map_bag.block_ctr.copy(t);
-      map_bag.map.extract_block(this.config.map_radius, [t.x, t.y, t.z]);
+      map_bag.map.prepare_isosurface(this.config.map_radius, [t.x, t.y, t.z]);
     }
     for (const mtype of map_bag.types) {
       const isolevel = (mtype === 'map_neg' ? -1 : 1) * map_bag.isolevel;
@@ -8276,7 +7539,6 @@ class Viewer {
   }
 
   add_map(map, is_diff_map) {
-    //map.show_debug_info();
     const map_bag = new MapBag(map, this.config, is_diff_map);
     this.map_bags.push(map_bag);
     this.add_el_objects(map_bag);
@@ -8284,7 +7546,8 @@ class Viewer {
   }
 
   load_file(url, options,
-            callback ) {
+            callback,
+            error_callback ) {
     if (this.renderer === null) return;  // no WebGL detected
     const req = new XMLHttpRequest();
     req.open('GET', url, true);
@@ -8306,10 +7569,12 @@ class Viewer {
           try {
             callback(req);
           } catch (e) {
-            self.hud('Error: ' + e.message + '\nwhen processing ' + url, 'ERR');
+            if (error_callback) error_callback(req, e);
+            else self.hud('Error: ' + e.message + '\nwhen processing ' + url, 'ERR');
           }
         } else {
-          self.hud('Failed to fetch ' + url, 'ERR');
+          if (error_callback) error_callback(req);
+          else self.hud('Failed to fetch ' + url, 'ERR');
         }
       }
     };
@@ -8326,7 +7591,8 @@ class Viewer {
     try {
       req.send(null);
     } catch (e) {
-      self.hud('loading ' + url + ' failed:\n' + e, 'ERR');
+      if (error_callback) error_callback(req, e);
+      else self.hud('loading ' + url + ' failed:\n' + e, 'ERR');
     }
   }
 
@@ -8432,8 +7698,12 @@ class Viewer {
   }
 
   resolve_gemmi(explicit_module) {
-    if (explicit_module) return Promise.resolve(explicit_module);
-    if (this.gemmi_module) return Promise.resolve(this.gemmi_module);
+    if (explicit_module) {
+      return Promise.resolve(explicit_module);
+    }
+    if (this.gemmi_module) {
+      return Promise.resolve(this.gemmi_module);
+    }
     if (this.gemmi_factory == null) return Promise.resolve(null);
     if (this.gemmi_loading == null) {
       const self = this;
@@ -8487,6 +7757,10 @@ class Viewer {
 
   load_pdb(url, options,
            callback) {
+    if (Array.isArray(url)) {
+      this.load_pdb_candidates(url, options, callback);
+      return;
+    }
     const self = this;
     const gemmi = options && options.gemmi;
     this.load_file(url, {binary: true, progress: true}, function (req) {
@@ -8500,6 +7774,38 @@ class Viewer {
         self.hud('Error: ' + e.message + '\nwhen processing ' + url, 'ERR');
       });
     });
+  }
+
+   load_pdb_candidates(urls, options,
+                              callback) {
+    const self = this;
+    const gemmi = options && options.gemmi;
+    const failed = [];
+
+    function try_next(index) {
+      if (index >= urls.length) {
+        self.hud('Failed to fetch ' + failed.join(' or '), 'ERR');
+        return;
+      }
+      const url = urls[index];
+      self.load_file(url, {binary: true, progress: true}, function (req) {
+        const t0 = performance.now();
+        self.load_coordinate_buffer(req.response, url, gemmi).then(function () {
+          console.log('coordinate file processed in', (performance.now() - t0).toFixed(2),
+                      (gemmi || self.gemmi_module) ? 'ms (using gemmi)' : 'ms');
+          if (options == null || !options.stay) self.set_view(options);
+          if (callback) callback();
+        }, function () {
+          failed.push(url);
+          try_next(index + 1);
+        });
+      }, function () {
+        failed.push(url);
+        try_next(index + 1);
+      });
+    }
+
+    try_next(0);
   }
 
   load_map(url, options,
@@ -8532,7 +7838,7 @@ class Viewer {
   load_map_from_buffer(buffer, options, gemmi) {
     const map = new ElMap();
     if (options.format === 'dsn6') {
-      map.from_dsn6(buffer);
+      map.from_dsn6(buffer, gemmi);
     } else {
       map.from_ccp4(buffer, true, gemmi);
     }
@@ -8572,7 +7878,10 @@ class Viewer {
   load_from_pdbe(pdb_id, callback) {
     const id = pdb_id.toLowerCase();
     this.load_pdb_and_maps(
-      'https://www.ebi.ac.uk/pdbe/entry-files/pdb' + id + '.ent',
+      [
+        'https://www.ebi.ac.uk/pdbe/entry-files/pdb' + id + '.ent',
+        'https://www.ebi.ac.uk/pdbe/entry-files/download/' + id + '_updated.cif',
+      ],
       'https://www.ebi.ac.uk/pdbe/coordinates/files/' + id + '.ccp4',
       'https://www.ebi.ac.uk/pdbe/coordinates/files/' + id + '_diff.ccp4',
       {format: 'ccp4'}, callback);
@@ -8695,12 +8004,12 @@ class ReciprocalSpaceMap extends ElMap {
     if (this.unit_cell == null) return;
     // unit of the map from dials.rs_mapper is (100A)^-1, we scale it to A^-1
     // We assume the "unit cell" is cubic -- as it is in rs_mapper.
-    const par = this.unit_cell.parameters;
-    this.box_size = [par[0]/ 100, par[1] / 100, par[2] / 100];
+    const uc = this.unit_cell;
+    this.box_size = [uc.a / 100, uc.b / 100, uc.c / 100];
     this.unit_cell = null;
   }
 
-  extract_block(radius, center) {
+  prepare_isosurface(radius, center) {
     const grid = this.grid;
     if (grid == null) return;
     const b = this.box_size;
@@ -9030,7 +8339,11 @@ class ReciprocalViewer extends Viewer {
     this.resolve_gemmi().then(function (gemmi) {
       if (gemmi == null) throw Error('Gemmi is required for CCP4 map loading.');
       if (self.map_bags.length > 0) {
-        self.clear_el_objects(self.map_bags.pop());
+        const old_map = self.map_bags.pop();
+        if (old_map != null) {
+          self.clear_el_objects(old_map);
+          old_map.map.dispose();
+        }
       }
       const map = new ReciprocalSpaceMap(buffer, gemmi);
       const map_range = map.box_size[0] / 2;
@@ -9173,41 +8486,49 @@ function log_timing(t0, text) {
   console.log(text + ': ' + (performance.now() - t0).toFixed(2) + ' ms.');
 }
 
-function add_map_from_mtz(viewer, mtz, map_data, is_diff) {
+function add_map_from_mtz(gemmi, viewer,
+                          mtz_map, is_diff) {
   const map = new ElMap();
-  const mc = mtz.cell;
-  map.unit_cell = new UnitCell(mc.a, mc.b, mc.c, mc.alpha, mc.beta, mc.gamma);
-  map.stats.rms = mtz.rmsd;
-  map.grid = new GridArray([mtz.nx, mtz.ny, mtz.nz]);
-  map.grid.values.set(map_data);
+  map.gemmi_module = gemmi;
+  map.wasm_map = mtz_map;
+  const mc = mtz_map.cell;
+  map.unit_cell = new gemmi.UnitCell(mc.a, mc.b, mc.c, mc.alpha, mc.beta, mc.gamma);
+  map.stats.mean = mtz_map.mean;
+  map.stats.rms = mtz_map.rms;
   viewer.add_map(map, is_diff);
 }
 
-function load_maps_from_mtz_buffer(viewer, mtz,
+function load_maps_from_mtz_buffer(gemmi, viewer, mtz,
                                    labels) {
   if (labels != null) {
     for (let n = 0; n < labels.length; n += 2) {
       if (labels[n] === '') continue;
       const t0 = performance.now();
-      const map_data = mtz.calculate_map_from_labels(labels[n], labels[n+1]);
-      log_timing(t0, 'map ' + mtz.nx + 'x' + mtz.ny + 'x' + mtz.nz +
+      const mtz_map = mtz.calculate_wasm_map_from_labels(labels[n], labels[n+1]);
+      log_timing(t0, 'map ' + (mtz_map ? mtz_map.nx : mtz.nx) + 'x' +
+                     (mtz_map ? mtz_map.ny : mtz.ny) + 'x' +
+                     (mtz_map ? mtz_map.nz : mtz.nz) +
                      ' calculated in');
-      if (map_data == null) {
+      if (mtz_map == null) {
         viewer.hud(mtz.last_error, 'ERR');
         continue;
       }
       const is_diff = (n % 4 == 2);
-      add_map_from_mtz(viewer, mtz, map_data, is_diff);
+      add_map_from_mtz(gemmi, viewer, mtz_map, is_diff);
     }
   } else {  // use default labels
     for (let nmap = 0; nmap < 2; ++nmap) {
       const is_diff = (nmap == 1);
       const t0 = performance.now();
-      const map_data = mtz.calculate_map(is_diff);
-      log_timing(t0, 'map ' + mtz.nx + 'x' + mtz.ny + 'x' + mtz.nz +
+      const mtz_map = mtz.calculate_wasm_map(is_diff);
+      log_timing(t0, 'map ' + (mtz_map ? mtz_map.nx : mtz.nx) + 'x' +
+                     (mtz_map ? mtz_map.ny : mtz.ny) + 'x' +
+                     (mtz_map ? mtz_map.nz : mtz.nz) +
                      ' calculated in');
-      if (map_data != null) {
-        add_map_from_mtz(viewer, mtz, map_data, is_diff);
+      if (mtz_map != null) {
+        add_map_from_mtz(gemmi, viewer, mtz_map, is_diff);
+      } else {
+        viewer.hud(mtz.last_error, 'ERR');
       }
     }
   }
@@ -9221,7 +8542,7 @@ function load_maps_from_mtz(gemmi, viewer, url,
     try {
       const mtz = gemmi.readMtz(req.response);
       //console.log("[after readMTZ] wasm mem:", gemmi.HEAPU8.length / 1024, "kb");
-      load_maps_from_mtz_buffer(viewer, mtz, labels);
+      load_maps_from_mtz_buffer(gemmi, viewer, mtz, labels);
     } catch (e) {
       viewer.hud(e.message, 'ERR');
       return;
@@ -9242,7 +8563,7 @@ function set_pdb_and_mtz_dropzone(gemmi, viewer,
           const t0 = performance.now();
           try {
             const mtz = gemmi.readMtz(evt.target.result);
-            load_maps_from_mtz_buffer(viewer, mtz);
+            load_maps_from_mtz_buffer(gemmi, viewer, mtz);
           } catch (e) {
             viewer.hud(e.message, 'ERR');
             return;
@@ -9260,7 +8581,6 @@ function set_pdb_and_mtz_dropzone(gemmi, viewer,
   });
 }
 
-exports.Block = Block;
 exports.BondType = BondType;
 exports.BufferAttribute = BufferAttribute;
 exports.BufferGeometry = BufferGeometry;
@@ -9286,7 +8606,6 @@ exports.STATE = STATE;
 exports.Scene = Scene;
 exports.ShaderMaterial = ShaderMaterial;
 exports.Texture = Texture;
-exports.UnitCell = UnitCell;
 exports.Vector3 = Vector3;
 exports.Viewer = Viewer;
 exports.WebGLRenderer = WebGLRenderer;
