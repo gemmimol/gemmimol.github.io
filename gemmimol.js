@@ -7529,7 +7529,8 @@ class Viewer {
       }
       this.close_cid_dialog();
     } catch (e) {
-      this.hud(e.message, 'ERR');
+      const msg = (e instanceof Error) ? e.message : 'Invalid CID selection: ' + cid;
+      this.hud(msg, 'ERR');
     }
   }
 
@@ -7982,6 +7983,33 @@ class Viewer {
     return { bag: bag, atoms: atoms, indices: indices };
   }
 
+  selection_anchor(bag, atoms) {
+    for (const atom of atoms) {
+      if (atom.is_main_conformer() &&
+          ((atom.name === 'CA' && atom.element === 'C') || atom.name === 'P')) {
+        return atom;
+      }
+    }
+    let x = 0, y = 0, z = 0;
+    for (const atom of atoms) {
+      x += atom.xyz[0];
+      y += atom.xyz[1];
+      z += atom.xyz[2];
+    }
+    const n = atoms.length;
+    let anchor = bag.model.get_nearest_atom(x / n, y / n, z / n, 'CA');
+    if (anchor == null) {
+      anchor = bag.model.get_nearest_atom(x / n, y / n, z / n, 'P');
+    }
+    if (anchor != null && anchor.is_main_conformer()) {
+      return anchor;
+    }
+    for (const atom of atoms) {
+      if (atom.is_main_conformer()) return atom;
+    }
+    return atoms[0];
+  }
+
   center_on_selection(cid, options={}) {
     const sel = this.selection_atoms(cid, options.bag);
     if (sel.atoms.length === 0) {
@@ -7996,6 +8024,8 @@ class Viewer {
     }
     const n = sel.atoms.length;
     this.hud('selection ' + cid + ': ' + n + ' atoms');
+    this.toggle_label(this.selected, false);
+    this.selected = {bag: sel.bag, atom: this.selection_anchor(sel.bag, sel.atoms)};
     this.controls.go_to(new Vector3(x / n, y / n, z / n),
                         null, null, options.steps);
     this.request_render();
