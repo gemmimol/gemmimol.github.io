@@ -70,75 +70,12 @@ function getGemmiBondData(gemmi, st,
   }).finally(() => bond_info.delete());
 }
 
-function modelsFromGemmi(gemmi, buffer, name,
-                                getMonomerCifs) {
-  const st = gemmi.read_structure(buffer, name);
-  return getGemmiBondData(gemmi, st, getMonomerCifs).then(function (bond_result) {
-    const bond_data = bond_result.bond_data;
-    const cell = st.cell;  // TODO: check if a copy of cell is created here
-    const models = [];
-    for (let i_model = 0; i_model < st.length; ++i_model) {
-      const model = st.at(i_model);
-      const m = new Model();
-      m.source_model_index = i_model;
-      m.unit_cell = new gemmi.UnitCell(cell.a, cell.b, cell.c, cell.alpha, cell.beta, cell.gamma);
-      let atom_i_seq = 0;
-      for (let i_chain = 0; i_chain < model.length; ++i_chain) {
-        const chain = model.at(i_chain);
-        const chain_name = chain.name;
-        for (let i_res = 0; i_res < chain.length; ++i_res) {
-          const res = chain.at(i_res);
-          const seqid = res.seqid_string;
-          const resname = res.name;
-          const ent_type = res.entity_type_string;
-          const ss = res.ss_from_file_string || 'Coil';
-          const strand_sense = res.strand_sense_from_file_string || 'NotStrand';
-          const is_ligand = (ent_type === 'non-polymer' || ent_type === 'branched');
-          for (let i_atom = 0; i_atom < res.length; ++i_atom) {
-            const atom = res.at(i_atom);
-            const new_atom = new Atom();
-            new_atom.i_seq = atom_i_seq++;
-            new_atom.chain = chain_name;
-            new_atom.chain_index = i_chain + 1;
-            new_atom.resname = resname;
-            new_atom.seqid = seqid;
-            new_atom.name = atom.name;
-            new_atom.altloc = atom.altloc === 0 ? '' : String.fromCharCode(atom.altloc);
-            new_atom.xyz = atom.pos;
-            new_atom.occ = atom.occ;
-            new_atom.b = atom.b_iso;
-            new_atom.element = atom.element_uname;
-            new_atom.is_metal = atom.is_metal;
-            new_atom.is_ligand = is_ligand;
-            new_atom.ss = ss;
-            new_atom.strand_sense = strand_sense;
-            m.atoms.push(new_atom);
-          }
-        }
-      }
-      m.calculate_bounds();
-      if (bond_data != null) {
-        m.apply_bond_data(bond_data);
-        m.bond_data = bond_data;
-      } else {
-        m.calculate_cubicles();
-      }
-      models.push(m);
-    }
-    //console.log("[after modelsFromGemmi] wasm mem:", gemmi.HEAPU8.length / 1024, "kb");
-    return { models: models, bonding: bond_result.info, structure: st };
-  }, function (err) {
-    st.delete();
-    throw err;
-  });
+function copy_unit_cell(gemmi, cell) {
+  return new gemmi.UnitCell(cell.a, cell.b, cell.c,
+                            cell.alpha, cell.beta, cell.gamma);
 }
 
-function modelFromGemmiStructure(gemmi, st,
-                                        bond_data) {
-  const cell = st.cell;
-  const gm = st.at(0);
-  const m = new Model();
-  m.unit_cell = new gemmi.UnitCell(cell.a, cell.b, cell.c, cell.alpha, cell.beta, cell.gamma);
+function fill_model_from_gemmi(gm, model) {
   let atom_i_seq = 0;
   for (let i_chain = 0; i_chain < gm.length; ++i_chain) {
     const chain = gm.at(i_chain);
@@ -169,20 +106,64 @@ function modelFromGemmiStructure(gemmi, st,
         new_atom.is_ligand = is_ligand;
         new_atom.ss = ss;
         new_atom.strand_sense = strand_sense;
-        m.atoms.push(new_atom);
+        if (new_atom.is_hydrogen()) {
+          model.has_hydrogens = true;
+          model.hydrogen_count++;
+        }
+        model.atoms.push(new_atom);
       }
     }
   }
-  m.calculate_bounds();
+}
+
+function finalize_model(model, bond_data,
+                        keep_bond_data) {
+  model.calculate_bounds();
   if (bond_data != null) {
-    m.apply_bond_data(bond_data);
+    model.apply_bond_data(bond_data);
+    if (keep_bond_data) model.bond_data = bond_data;
   } else {
-    m.calculate_cubicles();
+    model.calculate_cubicles();
   }
+}
+
+function modelsFromGemmi(gemmi, buffer, name,
+                                getMonomerCifs) {
+  const st = gemmi.read_structure(buffer, name);
+  return getGemmiBondData(gemmi, st, getMonomerCifs).then(function (bond_result) {
+    const bond_data = bond_result.bond_data;
+    const cell = st.cell;  // TODO: check if a copy of cell is created here
+    const models = [];
+    for (let i_model = 0; i_model < st.length; ++i_model) {
+      const model = st.at(i_model);
+      const m = new Model();
+      m.source_model_index = i_model;
+      m.unit_cell = copy_unit_cell(gemmi, cell);
+      fill_model_from_gemmi(model, m);
+      finalize_model(m, bond_data, true);
+      models.push(m);
+    }
+    //console.log("[after modelsFromGemmi] wasm mem:", gemmi.HEAPU8.length / 1024, "kb");
+    return { models: models, bonding: bond_result.info, structure: st };
+  }, function (err) {
+    st.delete();
+    throw err;
+  });
+}
+
+function modelFromGemmiStructure(gemmi, st,
+                                        bond_data) {
+  const cell = st.cell;
+  const gm = st.at(0);
+  const m = new Model();
+  m.unit_cell = copy_unit_cell(gemmi, cell);
+  fill_model_from_gemmi(gm, m);
+  finalize_model(m, bond_data);
   return m;
 }
 
 class Model {
+  
   
   
   
@@ -197,6 +178,7 @@ class Model {
     this.atoms = [];
     this.unit_cell = null;
     this.has_hydrogens = false;
+    this.hydrogen_count = 0;
     this.lower_bound = [0, 0, 0];
     this.upper_bound = [0, 0, 0];
     this.bond_data = null;
@@ -327,6 +309,30 @@ class Model {
     return cubes;
   }
 
+  add_missing_hydrogen_bonds() {
+    const max_d2 = 1.45 * 1.45;
+    const residues = this.get_residues();
+    for (const atom of this.atoms) {
+      if (!atom.is_hydrogen() || atom.bonds.length !== 0) continue;
+      const residue = residues[atom.resid()];
+      if (residue == null) continue;
+      let nearest = null;
+      let min_d2 = Infinity;
+      for (const other of residue) {
+        if (other === atom || other.is_hydrogen()) continue;
+        if (!atom.is_same_conformer(other)) continue;
+        const d2 = atom.distance_sq(other);
+        if (d2 < min_d2) {
+          min_d2 = d2;
+          nearest = other;
+        }
+      }
+      if (nearest != null && min_d2 <= max_d2) {
+        this.add_bond(atom.i_seq, nearest.i_seq, BondType.Single);
+      }
+    }
+  }
+
   apply_bond_data(bond_data) {
     for (const atom of this.atoms) {
       atom.bonds = [];
@@ -342,6 +348,7 @@ class Model {
       }
       this.add_bond(idx1, idx2, bond_type);
     }
+    this.add_missing_hydrogen_bonds();
     this.calculate_cubicles();
   }
 
@@ -422,10 +429,6 @@ class Atom {
     return dx*dx + dy*dy + dz*dz;
   }
 
-  distance(other) {
-    return Math.sqrt(this.distance_sq(other));
-  }
-
   midpoint(other) {
     return [(this.xyz[0] + other.xyz[0]) / 2,
             (this.xyz[1] + other.xyz[1]) / 2,
@@ -434,10 +437,6 @@ class Atom {
 
   is_hydrogen() {
     return this.element === 'H' || this.element === 'D';
-  }
-
-  is_ion() {
-    return this.element === this.resname;
   }
 
   is_water() {
@@ -4799,8 +4798,8 @@ function makeCube(size, ctr, options) {
 }
 
 function makeMultiColorLines(pos,
-                                    colors,
-                                    linewidth) {
+                             colors,
+                             linewidth) {
   const material = new ShaderMaterial({
     uniforms: makeUniforms({}),
     vertexShader: varcolor_vert,
@@ -6257,7 +6256,7 @@ class ModelBag {
     //return atoms.filter(function(a) { return a.element !== 'H'; });
     const non_h = [];
     for (const atom of atoms) {
-      if (atom.element !== 'H') non_h.push(atom);
+      if (!atom.is_hydrogen()) non_h.push(atom);
     }
     return non_h;
   }
@@ -6290,7 +6289,7 @@ class ModelBag {
       } else { // bonded, draw lines
         for (let j = 0; j < atom.bonds.length; j++) {
           const other = this.model.atoms[atom.bonds[j]];
-          if (!hydrogens && other.element === 'H') continue;
+          if (!hydrogens && other.is_hydrogen()) continue;
           // Coot show X-H bonds as thinner lines in a single color.
           // Here we keep it simple and render such bonds like all others.
           const bond_type = atom.bond_types[j];
@@ -6381,7 +6380,7 @@ class ModelBag {
       if (atom.bonds.length === 0) continue;
       for (let j = 0; j < atom.bonds.length; j++) {
         const other = this.model.atoms[atom.bonds[j]];
-        if (!hydrogens && other.element === 'H') continue;
+        if (!hydrogens && other.is_hydrogen()) continue;
         const bond_type = atom.bond_types[j];
         if (bond_type === BondType.Metal) {
           const mid = this.bond_half_end(atom, other, radius * 0.5);
@@ -6799,7 +6798,6 @@ class Viewer {
     }
     this.create_cid_dialog();
     this.create_metals_menu();
-    this.create_ligands_menu();
     this.decor.zoom_grid.visible = false;
     this.scene.add(this.decor.zoom_grid);
 
@@ -7383,7 +7381,8 @@ class Viewer {
     const radius = this.config.map_radius;
     const images = gemmi.get_nearby_sym_ops(structure, pos, radius);
     if (images.size() === 0) {
-      this.hud('No symmetry mates within ' + radius + '\u00C5');
+      this.hud('No symmetry mates within map radius ' + radius +
+               '\u00C5 (use [ and ] to change the map radius)');
       images.delete();
       return;
     }
@@ -7544,10 +7543,6 @@ class Viewer {
     row.appendChild(this.ligands_select_el);
     wrapper.appendChild(row);
     this.container.appendChild(wrapper);
-  }
-
-  create_ligands_menu() {
-    // created together with metals menu
   }
 
   update_nav_menus() {
@@ -7868,8 +7863,10 @@ class Viewer {
     // y
     kb[89] = function () {
       this.config.hydrogens = !this.config.hydrogens;
+      const n_h = this.current_model_hydrogen_count();
       this.hud((this.config.hydrogens ? 'show' : 'hide') +
-               ' hydrogens (if any)');
+               ' hydrogens (' + n_h + ' H/D atom' + (n_h === 1 ? '' : 's') +
+               ' in model)');
       this.redraw_models();
     };
     // backslash
@@ -7946,6 +7943,11 @@ class Viewer {
                           this.relX(info), this.relY(info), info.dist);
     }
     this.request_render();
+  }
+
+  current_model_hydrogen_count() {
+    const bag = this.selected.bag || this.model_bags[0];
+    return bag ? bag.model.hydrogen_count : 0;
   }
 
   touchmove(event) {
@@ -9286,8 +9288,6 @@ exports.makeCube = makeCube;
 exports.makeGrid = makeGrid;
 exports.makeLineMaterial = makeLineMaterial;
 exports.makeLineSegments = makeLineSegments;
-exports.makeLines = makeLines;
-exports.makeMultiColorLines = makeMultiColorLines;
 exports.makeRgbBox = makeRgbBox;
 exports.makeRibbon = makeRibbon;
 exports.makeSticks = makeSticks;
