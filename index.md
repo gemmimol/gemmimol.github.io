@@ -22,6 +22,7 @@ Try it:
 - [1MRU](1mru.html) (60kDa, 3Å),
   and in [dual view](dual.html) with PDB_REDO,
 - [3KW8](3kw8.html) (30kDa, 2.3Å),
+- [4UN4](4un4.html) (protein-DNA complex, 2.37Å),
 - [a blob](dimple_thaum.html#xyz=14,18,12&eye=80,71,-41&zoom=70)
   (Dimple result, thaumatin, 1.4Å),
 - or any [local file or wwPDB entry](view/).
