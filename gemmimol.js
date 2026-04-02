@@ -7743,7 +7743,18 @@ const ColorSchemes$1 = {
   },
 };
 
-const SYMMETRY_MATE_COLOR = new Color(0x1933CC);
+const SYMMETRY_MATE_COLORS = {
+  C: new Color(0x1933CC),
+  O: new Color(0x5D1F5D),
+  S: new Color(0x626E62),
+};
+
+function symmetry_mate_color(atom, elem_colors) {
+  return SYMMETRY_MATE_COLORS[atom.element] ||
+         elem_colors[atom.element] ||
+         elem_colors.def ||
+         SYMMETRY_MATE_COLORS.C;
+}
 
 
 const INIT_HUD_TEXT = 'This is GemmiMol not Coot. ' +
@@ -7959,7 +7970,7 @@ class ModelBag {
 
   atom_colors(atoms) {
     if (this.color_override != null) {
-      return atoms.map(() => this.color_override);
+      return atoms.map((atom) => this.color_override(atom));
     }
     return color_by(this.conf.color_prop, atoms, this.conf.colors, this.hue_shift);
   }
@@ -9256,7 +9267,7 @@ class Viewer {
       sym_st.delete();
       const sym_bag = new ModelBag(model, this.config, this.window_size);
       sym_bag.hue_shift = 0;
-      sym_bag.color_override = SYMMETRY_MATE_COLOR.clone();
+      sym_bag.color_override = (atom) => symmetry_mate_color(atom, sym_bag.conf.colors);
       sym_bag.symop = image.symmetry_code(true);
       shown_symops.push(sym_bag.symop);
       sym_bag.visible = true;
