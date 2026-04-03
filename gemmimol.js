@@ -12,7 +12,7 @@ typeof define === 'function' && define.amd ? define(['exports'], factory) :
 })(this, (function (exports) { 'use strict';
 
 var VERSION = exports.VERSION = "0.8.3";
-var GIT_DESCRIBE = exports.GIT_DESCRIBE = "0.8.3-17-ge38ba55-dirty";
+var GIT_DESCRIBE = exports.GIT_DESCRIBE = "0.8.3-21-g5581654-dirty";
 var GEMMI_GIT_DESCRIBE = exports.GEMMI_GIT_DESCRIBE = "v0.7.5-141-g3fd5922f";
 
 
@@ -777,7 +777,7 @@ class Cubicles {
   }
 }
 
-function _nullishCoalesce$1(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return rhsFn(); } }
+function _nullishCoalesce$2(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return rhsFn(); } }
 
 
 
@@ -1049,14 +1049,14 @@ class ElMap {
     }
     const result = this.wasm_map.find_blobs(
       cutoff,
-      _nullishCoalesce$1(options.min_volume, () => ( 10.0)),
-      _nullishCoalesce$1(options.min_score, () => ( 15.0)),
-      _nullishCoalesce$1(options.min_peak, () => ( 0.0)),
-      _nullishCoalesce$1(options.negate, () => ( false)),
-      _nullishCoalesce$1(options.structure, () => ( null)),
-      _nullishCoalesce$1(options.model_index, () => ( 0)),
-      _nullishCoalesce$1(options.mask_radius, () => ( 2.0)),
-      _nullishCoalesce$1(options.mask_waters, () => ( false))
+      _nullishCoalesce$2(options.min_volume, () => ( 10.0)),
+      _nullishCoalesce$2(options.min_score, () => ( 15.0)),
+      _nullishCoalesce$2(options.min_peak, () => ( 0.0)),
+      _nullishCoalesce$2(options.negate, () => ( false)),
+      _nullishCoalesce$2(options.structure, () => ( null)),
+      _nullishCoalesce$2(options.model_index, () => ( 0)),
+      _nullishCoalesce$2(options.mask_radius, () => ( 2.0)),
+      _nullishCoalesce$2(options.mask_waters, () => ( false))
     );
     if (result == null) return [];
     try {
@@ -5059,6 +5059,11 @@ let CatmullRomCurve3$1 = class CatmullRomCurve3 extends Curve {
 
 const CatmullRomCurve3 = CatmullRomCurve3$1;
 
+function _nullishCoalesce$1(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return rhsFn(); } }
+
+
+
+
 const CUBE_EDGES =
   [[0, 0, 0], [1, 0, 0],
    [0, 0, 0], [0, 1, 0],
@@ -5665,6 +5670,129 @@ function makeChickenWire(data,
     type: 'um_line_chickenwire',
   });
   return new LineSegments(geom, material);
+}
+
+function weldSurface(data) {
+  const input_pos = data.vertices;
+  const input_idx = data.segments;
+  const pos = [];
+  const remapped = (input_pos.length / 3 < 65536 ? new Uint16Array(input_idx.length)
+                                                 : new Uint32Array(input_idx.length));
+  const key_to_index = new Map();
+  for (let i = 0; i < input_pos.length; i += 3) {
+    const key = Math.round(input_pos[i] * 1e4) + ',' +
+                Math.round(input_pos[i+1] * 1e4) + ',' +
+                Math.round(input_pos[i+2] * 1e4);
+    let idx = key_to_index.get(key);
+    if (idx === undefined) {
+      idx = pos.length / 3;
+      key_to_index.set(key, idx);
+      pos.push(input_pos[i], input_pos[i+1], input_pos[i+2]);
+    }
+    remapped[i / 3] = idx;
+  }
+  const tri = (pos.length < 3*65536 ? new Uint16Array(input_idx.length)
+                                    : new Uint32Array(input_idx.length));
+  for (let i = 0; i < input_idx.length; i++) {
+    tri[i] = remapped[input_idx[i]];
+  }
+  return {
+    position: new Float32Array(pos),
+    index: tri,
+  };
+}
+
+function surfaceNormals(position, index) {
+  const normal = new Float32Array(position.length);
+  for (let i = 0; i + 2 < index.length; i += 3) {
+    const i0 = 3 * index[i];
+    const i1 = 3 * index[i+1];
+    const i2 = 3 * index[i+2];
+    const ax = position[i1] - position[i0];
+    const ay = position[i1+1] - position[i0+1];
+    const az = position[i1+2] - position[i0+2];
+    const bx = position[i2] - position[i0];
+    const by = position[i2+1] - position[i0+1];
+    const bz = position[i2+2] - position[i0+2];
+    const nx = ay * bz - az * by;
+    const ny = az * bx - ax * bz;
+    const nz = ax * by - ay * bx;
+    normal[i0] += nx; normal[i0+1] += ny; normal[i0+2] += nz;
+    normal[i1] += nx; normal[i1+1] += ny; normal[i1+2] += nz;
+    normal[i2] += nx; normal[i2+1] += ny; normal[i2+2] += nz;
+  }
+  for (let i = 0; i < normal.length; i += 3) {
+    const nx = normal[i];
+    const ny = normal[i+1];
+    const nz = normal[i+2];
+    const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+    if (len > 1e-12) {
+      normal[i] /= len;
+      normal[i+1] /= len;
+      normal[i+2] /= len;
+    } else {
+      normal[i] = 0;
+      normal[i+1] = 0;
+      normal[i+2] = 1;
+    }
+  }
+  return normal;
+}
+
+const surface_vert = `
+attribute vec3 normal;
+varying vec3 vnormal;
+varying vec3 vview;
+void main() {
+  vec4 mv_pos = modelViewMatrix * vec4(position, 1.0);
+  vnormal = normalize((modelViewMatrix * vec4(normal, 0.0)).xyz);
+  vview = -mv_pos.xyz;
+  gl_Position = projectionMatrix * mv_pos;
+}
+`;
+
+const surface_frag = `
+${fog_pars_fragment}
+uniform vec3 vcolor;
+uniform vec3 lightDir;
+uniform float opacity;
+varying vec3 vnormal;
+varying vec3 vview;
+void main() {
+  vec3 normal = normalize(vnormal);
+  if (!gl_FrontFacing) normal = -normal;
+  vec3 view_dir = normalize(vview);
+  vec3 light_dir = normalize(lightDir);
+  float diffuse = clamp(dot(normal, light_dir), 0.0, 1.0);
+  float rim = pow(1.0 - clamp(dot(normal, view_dir), 0.0, 1.0), 1.7);
+  vec3 base = vcolor * (0.30 + 0.55 * diffuse);
+  vec3 color = mix(base, vec3(1.0), 0.22 * rim);
+  float alpha = opacity * (0.55 + 0.75 * rim);
+  gl_FragColor = vec4(color, alpha);
+${fog_end_fragment}
+}`;
+
+function makeSmoothSurface(data,
+                                  options) {
+  const welded = weldSurface(data);
+  const geom = new BufferGeometry();
+  geom.setAttribute('position', new BufferAttribute(welded.position, 3));
+  geom.setIndex(new BufferAttribute(welded.index, 1));
+  geom.setAttribute('normal', new BufferAttribute(surfaceNormals(welded.position, welded.index), 3));
+  const material = new ShaderMaterial({
+    uniforms: makeUniforms({
+      vcolor: options.color,
+      lightDir: light_dir,
+      opacity: _nullishCoalesce$1(options.opacity, () => ( 0.24)),
+    }),
+    vertexShader: surface_vert,
+    fragmentShader: surface_frag,
+    fog: true,
+    type: 'um_surface',
+  });
+  material.transparent = true;
+  material.depthWrite = false;
+  return new Mesh(geom, material);
 }
 
 
@@ -7768,8 +7896,17 @@ const RENDER_STYLES = ['sticks', 'lines', 'backbone', 'cartoon', 'cartoon+sticks
                        'ribbon', 'ball&stick'];
 const LIGAND_STYLES = ['ball&stick', 'sticks', 'lines'];
 const WATER_STYLES = ['sphere', 'cross', 'invisible'];
-const MAP_STYLES = ['marching cubes', 'squarish'/*, 'snapped MC'*/];
+const MAP_STYLES = ['marching cubes', 'squarish', 'smooth surface'/*, 'snapped MC'*/];
 const LABEL_FONTS = ['bold 14px', '14px', '16px', 'bold 16px'];
+
+function map_style_method(style) {
+  return style === 'smooth surface' ? 'marching cubes' : style;
+}
+
+function map_style_is_surface(style) {
+  return style === 'smooth surface';
+}
+
 function rainbow_value(v, vmin, vmax) {
   const c = new Color(0xe0e0e0);
   if (vmin < vmax) {
@@ -8422,6 +8559,9 @@ class Viewer {
   
   
   
+  
+  
+  
 
   constructor(options) {
     // rendered objects
@@ -8524,6 +8664,8 @@ class Viewer {
     this.download_select_el = null;
     this.delete_select_el = null;
     this.mutate_select_el = null;
+    this.histogram_el = null;
+    this.histogram_redraw = null;
     this.blob_hits = [];
     this.blob_map_bag = null;
     this.blob_negate = false;
@@ -8534,6 +8676,7 @@ class Viewer {
     this.fps_text = 'FPS: --';
     this.last_frame_time = 0;
     this.frame_times = [];
+    this.map_radius_auto = !('map_radius' in options) && !('max_map_radius' in options);
     if (this.hud_el) {
       if (this.hud_el.innerHTML === '') this.hud_el.innerHTML = INIT_HUD_TEXT;
       this.initial_hud_html = this.hud_el.innerHTML;
@@ -9041,12 +9184,18 @@ class Viewer {
     }
     for (const mtype of map_bag.types) {
       const isolevel = (mtype === 'map_neg' ? -1 : 1) * map_bag.isolevel;
-      const iso = map_bag.map.isomesh_in_block(isolevel, this.config.map_style);
+      const iso = map_bag.map.isomesh_in_block(isolevel,
+                                               map_style_method(this.config.map_style));
       if (iso == null) continue;
-      const obj = makeChickenWire(iso, {
-        color: this.config.colors[mtype],
-        linewidth: this.config.map_line,
-      });
+      const obj = map_style_is_surface(this.config.map_style) ?
+        makeSmoothSurface(iso, {
+          color: this.config.colors[mtype],
+          opacity: 0.22,
+        }) :
+        makeChickenWire(iso, {
+          color: this.config.colors[mtype],
+          linewidth: this.config.map_line,
+        });
       map_bag.el_objects.push(obj);
       this.scene.add(obj);
     }
@@ -9072,9 +9221,13 @@ class Viewer {
     }
     this.hud('map ' + (map_idx+1) + ' level =  ' + abs_text + ' ' +
              map_bag.map.unit + ' (' + map_bag.isolevel.toFixed(2) + ' rmsd)');
+    if (this.histogram_redraw && map_idx === 0) {
+      this.histogram_redraw();
+    }
   }
 
   change_map_radius(delta) {
+    this.map_radius_auto = false;
     const rmax = this.config.max_map_radius;
     const cf = this.config;
     cf.map_radius = Math.min(Math.max(cf.map_radius + delta, 0), rmax);
@@ -10810,6 +10963,287 @@ class Viewer {
     }
   }
 
+  toggle_histogram() {
+    if (this.histogram_el) {
+      this.histogram_el.remove();
+      this.histogram_el = null;
+      this.histogram_redraw = null;
+      return;
+    }
+    const map_bag = this.map_bags[0];
+    if (!map_bag) {
+      this.hud('no map loaded');
+      return;
+    }
+    const map = map_bag.map;
+    let data = null;
+    if (map.wasm_map != null) {
+      data = map.wasm_map.data();
+    } else if (map.grid != null) {
+      data = map.grid.values;
+    }
+    if (data == null || data.length === 0) {
+      this.hud('no map data for histogram');
+      return;
+    }
+    this.draw_histogram(data, map_bag);
+  }
+
+  draw_histogram(data, map_bag) {
+    const map = map_bag.map;
+    const mean = map.stats.mean;
+    const rms = map.stats.rms;
+
+    const n_bins = 200;
+    // find actual data range for the right tail
+    let data_max = -Infinity;
+    for (let i = 0; i < data.length; i++) {
+      if (data[i] > data_max) data_max = data[i];
+    }
+    const range_min = Math.max(0, mean - 6 * rms);
+    const range_max = Math.max(mean + 6 * rms, data_max);
+    const bin_width = (range_max - range_min) / n_bins;
+    const counts = new Uint32Array(n_bins);
+    for (let i = 0; i < data.length; i++) {
+      const v = data[i];
+      let bin = Math.floor((v - range_min) / bin_width);
+      if (bin < 0) bin = 0;
+      if (bin >= n_bins) bin = n_bins - 1;
+      counts[bin]++;
+    }
+
+    const log_counts = new Float64Array(n_bins);
+    let max_log = 0;
+    for (let i = 0; i < n_bins; i++) {
+      log_counts[i] = counts[i] > 0 ? Math.log10(counts[i]) : 0;
+      if (log_counts[i] > max_log) max_log = log_counts[i];
+    }
+
+    const W = 400;
+    const H = 220;
+    const pad_left = 40;
+    const pad_right = 10;
+    const pad_top = 25;
+    const pad_bottom = 35;
+    const plot_w = W - pad_left - pad_right;
+    const plot_h = H - pad_top - pad_bottom;
+
+    const val2x = (v) =>
+      pad_left + ((v - range_min) / (range_max - range_min)) * plot_w;
+    const x2sigma = (x) =>
+      ((x - pad_left) / plot_w * (range_max - range_min) + range_min - mean) / rms;
+
+    // wrapper
+    const wrapper = document.createElement('div');
+    wrapper.style.position = 'absolute';
+    wrapper.style.right = '10px';
+    wrapper.style.top = '50%';
+    wrapper.style.transform = 'translateY(-50%)';
+    wrapper.style.zIndex = '10';
+
+    // container for the two canvases
+    const canvas_box = document.createElement('div');
+    canvas_box.style.position = 'relative';
+    canvas_box.style.width = W + 'px';
+    canvas_box.style.height = H + 'px';
+
+    // minimize button
+    const btn = document.createElement('div');
+    btn.style.position = 'absolute';
+    btn.style.top = '2px';
+    btn.style.right = '2px';
+    btn.style.width = '18px';
+    btn.style.height = '18px';
+    btn.style.lineHeight = '16px';
+    btn.style.textAlign = 'center';
+    btn.style.cursor = 'pointer';
+    btn.style.color = '#aaa';
+    btn.style.fontSize = '14px';
+    btn.style.zIndex = '12';
+    btn.textContent = '\u2013';
+    btn.title = 'minimize';
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      if (canvas_box.style.display === 'none') {
+        canvas_box.style.display = '';
+        btn.textContent = '\u2013';
+        btn.title = 'minimize';
+        btn.style.position = 'absolute';
+        btn.style.backgroundColor = '';
+      } else {
+        canvas_box.style.display = 'none';
+        btn.textContent = '\u25a4';
+        btn.title = 'show histogram';
+        btn.style.position = '';
+        btn.style.backgroundColor = 'rgba(0,0,0,0.7)';
+      }
+    };
+
+    // background canvas: bars, axes, labels (drawn once)
+    const bg = document.createElement('canvas');
+    bg.width = W;
+    bg.height = H;
+    bg.style.position = 'absolute';
+    bg.style.left = '0';
+    bg.style.top = '0';
+
+    const bg_ctx = bg.getContext('2d');
+    bg_ctx.fillStyle = 'rgba(0, 0, 0, 0.85)';
+    bg_ctx.fillRect(0, 0, W, H);
+
+    // bars
+    const bar_w = plot_w / n_bins;
+    bg_ctx.fillStyle = '#5588cc';
+    for (let i = 0; i < n_bins; i++) {
+      if (log_counts[i] === 0) continue;
+      const bar_h = (log_counts[i] / max_log) * plot_h;
+      bg_ctx.fillRect(pad_left + i * bar_w, pad_top + plot_h - bar_h,
+                      Math.max(bar_w - 0.5, 1), bar_h);
+    }
+
+    // mean line
+    const mean_x = val2x(mean);
+    if (mean_x >= pad_left && mean_x <= pad_left + plot_w) {
+      bg_ctx.strokeStyle = '#aaa';
+      bg_ctx.lineWidth = 1;
+      bg_ctx.setLineDash([4, 3]);
+      bg_ctx.beginPath();
+      bg_ctx.moveTo(mean_x, pad_top);
+      bg_ctx.lineTo(mean_x, pad_top + plot_h);
+      bg_ctx.stroke();
+      bg_ctx.setLineDash([]);
+    }
+
+    // axes
+    bg_ctx.strokeStyle = '#888';
+    bg_ctx.lineWidth = 1;
+    bg_ctx.beginPath();
+    bg_ctx.moveTo(pad_left, pad_top);
+    bg_ctx.lineTo(pad_left, pad_top + plot_h);
+    bg_ctx.lineTo(pad_left + plot_w, pad_top + plot_h);
+    bg_ctx.stroke();
+
+    // x-axis labels (in sigma)
+    bg_ctx.fillStyle = '#ccc';
+    bg_ctx.font = '10px monospace';
+    bg_ctx.textAlign = 'center';
+    for (let s = -5; s <= 5; s += 1) {
+      const v = mean + s * rms;
+      const x = val2x(v);
+      if (x < pad_left || x > pad_left + plot_w) continue;
+      bg_ctx.beginPath();
+      bg_ctx.moveTo(x, pad_top + plot_h);
+      bg_ctx.lineTo(x, pad_top + plot_h + 4);
+      bg_ctx.stroke();
+      if (s % 2 === 0) {
+        bg_ctx.fillText(s + '\u03c3', x, pad_top + plot_h + 15);
+      }
+    }
+
+    // y-axis labels
+    bg_ctx.textAlign = 'right';
+    for (let p = 0; p <= max_log; p += 1) {
+      const y = pad_top + plot_h - (p / max_log) * plot_h;
+      bg_ctx.beginPath();
+      bg_ctx.moveTo(pad_left - 4, y);
+      bg_ctx.lineTo(pad_left, y);
+      bg_ctx.stroke();
+      bg_ctx.fillText('10' + (p === 0 ? '\u2070' :
+                               p === 1 ? '\u00b9' :
+                               p === 2 ? '\u00b2' :
+                               p === 3 ? '\u00b3' :
+                               '\u2074\u207a'), pad_left - 6, y + 3);
+    }
+
+    // title
+    bg_ctx.fillStyle = '#ddd';
+    bg_ctx.font = '11px sans-serif';
+    bg_ctx.textAlign = 'left';
+    const title = (map_bag.name || 'map') +
+      '  \u03bc=' + mean.toFixed(3) + '  \u03c3=' + rms.toFixed(3);
+    bg_ctx.fillText(title, pad_left, pad_top - 10);
+
+    // x-axis label
+    bg_ctx.fillStyle = '#aaa';
+    bg_ctx.font = '10px sans-serif';
+    bg_ctx.textAlign = 'center';
+    bg_ctx.fillText('density (' + map.unit + ')', pad_left + plot_w / 2,
+                    H - 3);
+
+    // overlay canvas: isolevel line (redrawn on interaction)
+    const overlay = document.createElement('canvas');
+    overlay.width = W;
+    overlay.height = H;
+    overlay.style.position = 'absolute';
+    overlay.style.left = '0';
+    overlay.style.top = '0';
+    overlay.style.cursor = 'ew-resize';
+    const ov_ctx = overlay.getContext('2d');
+
+    const iso_color = map_bag.is_diff_map ? '#40b040' : '#ff6644';
+    const draw_isolevel = () => {
+      ov_ctx.clearRect(0, 0, W, H);
+      const abs_level = map.abs_level(map_bag.isolevel);
+      const iso_x = val2x(abs_level);
+      if (iso_x >= pad_left && iso_x <= pad_left + plot_w) {
+        ov_ctx.strokeStyle = iso_color;
+        ov_ctx.lineWidth = 2;
+        ov_ctx.beginPath();
+        ov_ctx.moveTo(iso_x, pad_top);
+        ov_ctx.lineTo(iso_x, pad_top + plot_h);
+        ov_ctx.stroke();
+        ov_ctx.fillStyle = iso_color;
+        ov_ctx.font = '10px monospace';
+        ov_ctx.textAlign = 'center';
+        ov_ctx.fillText(map_bag.isolevel.toFixed(1) + '\u03c3',
+                        iso_x, pad_top - 3);
+      }
+    };
+    draw_isolevel();
+
+    // interactive isolevel selection
+    let dragging = false;
+    const set_level_from_x = (x) => {
+      const sigma = x2sigma(x);
+      const sigma_min = (range_min - mean) / rms;
+      const sigma_max = (range_max - mean) / rms;
+      const clamped = Math.round(Math.max(sigma_min, Math.min(sigma_max, sigma)) * 10) / 10;
+      if (clamped === map_bag.isolevel) return;
+      map_bag.isolevel = clamped;
+      draw_isolevel();
+      this.clear_el_objects(map_bag);
+      this.add_el_objects(map_bag);
+      const abs_level = map.abs_level(map_bag.isolevel);
+      this.hud('map level = ' + abs_level.toFixed(4) + ' ' +
+               map.unit + ' (' + map_bag.isolevel.toFixed(2) + ' rmsd)');
+      this.request_render();
+    };
+    overlay.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dragging = true;
+      set_level_from_x(e.offsetX);
+    });
+    overlay.addEventListener('mousemove', (e) => {
+      if (!dragging) return;
+      e.preventDefault();
+      e.stopPropagation();
+      set_level_from_x(e.offsetX);
+    });
+    const stop_drag = () => { dragging = false; };
+    overlay.addEventListener('mouseup', stop_drag);
+    overlay.addEventListener('mouseleave', stop_drag);
+
+    canvas_box.appendChild(bg);
+    canvas_box.appendChild(overlay);
+    wrapper.appendChild(btn);
+    wrapper.appendChild(canvas_box);
+
+    this.histogram_el = wrapper;
+    this.histogram_redraw = draw_isolevel;
+    (this.container || document.body).appendChild(wrapper);
+  }
+
   update_help() {
     const el = this.help_el;
     if (!el) return;
@@ -11004,6 +11438,10 @@ class Viewer {
     kb[84] = function ( evt) {
       this.select_next('waters as', 'water_style', WATER_STYLES, evt.shiftKey);
       this.redraw_models();
+    };
+    // g
+    kb[71] = function () {
+      this.toggle_histogram();
     };
     // u
     kb[85] = function () {
@@ -11373,11 +11811,47 @@ class Viewer {
     }
   }
 
+  auto_adjust_map_radius() {
+    if (!this.map_radius_auto || this.map_bags.length === 0) return;
+    const model_bag = this.model_bags.find((bag) =>
+      bag.symop === '' &&
+      bag.model.unit_cell != null &&
+      !bag.model.unit_cell.is_crystal());
+    if (model_bag == null) return;
+    const center = model_bag.model.get_center();
+    const required_radius = Math.max(
+      center[0] - model_bag.model.lower_bound[0],
+      model_bag.model.upper_bound[0] - center[0],
+      center[1] - model_bag.model.lower_bound[1],
+      model_bag.model.upper_bound[1] - center[1],
+      center[2] - model_bag.model.lower_bound[2],
+      model_bag.model.upper_bound[2] - center[2]
+    ) + 2;
+    let cell_limit = Infinity;
+    for (const map_bag of this.map_bags) {
+      const uc = map_bag.map.unit_cell;
+      if (uc == null) continue;
+      const half_edge = 0.5 * Math.min(uc.a, uc.b, uc.c);
+      if (Number.isFinite(half_edge) && half_edge > 0) {
+        cell_limit = Math.min(cell_limit, half_edge);
+      }
+    }
+    const radius = Math.min(required_radius, cell_limit);
+    if (!Number.isFinite(radius) || radius <= this.config.map_radius + 1e-6) return;
+    const rounded_radius = Math.round(radius * 10) / 10;
+    const suggested_max = Math.max(rounded_radius + 20, rounded_radius * 1.25);
+    const rounded_max = Math.round(Math.min(cell_limit, suggested_max) * 10) / 10;
+    this.config.map_radius = rounded_radius;
+    this.config.max_map_radius = Math.max(this.config.max_map_radius, rounded_max);
+    this.redraw_maps(true);
+  }
+
   add_model(model, options={}) {
     const model_bag = new ModelBag(model, this.config, this.window_size);
     model_bag.hue_shift = options.hue_shift || 0.06 * this.model_bags.length;
     model_bag.gemmi_selection = options.gemmi_selection || null;
     this.model_bags.push(model_bag);
+    this.auto_adjust_map_radius();
     this.set_model_objects(model_bag);
     this.update_nav_menus();
     this.request_render();
@@ -11387,6 +11861,7 @@ class Viewer {
     const map_bag = new MapBag(map, this.config, is_diff_map);
     this.map_bags.push(map_bag);
     this.add_el_objects(map_bag);
+    this.auto_adjust_map_radius();
     this.update_nav_menus();
     this.request_render();
   }
@@ -11886,7 +12361,8 @@ Viewer.prototype.KEYBOARD_HELP = [
   'Y = hydrogens',
   'V = inactive models',
   'R = center view',
-  'W = wireframe style',
+  'G = density histogram',
+  'W = density style',
   'I = spin',
   'K = rock',
   'Home/End = stick width',
@@ -12577,6 +13053,7 @@ exports.makeLineMaterial = makeLineMaterial;
 exports.makeLineSegments = makeLineSegments;
 exports.makeRgbBox = makeRgbBox;
 exports.makeRibbon = makeRibbon;
+exports.makeSmoothSurface = makeSmoothSurface;
 exports.makeSticks = makeSticks;
 exports.makeUniforms = makeUniforms;
 exports.makeWheels = makeWheels;
