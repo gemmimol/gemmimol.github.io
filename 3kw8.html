@@ -28,15 +28,28 @@
      z-index: 9;
    }
    #gm-overlay > * { pointer-events: auto; }
-   #hud {
-     font-size: 15px;
+   #gm-overlay > header {
      color: #ddd;
      background-color: rgba(0,0,0,0.6);
+     padding: 3px 8px;
+     border-radius: 5px;
+     cursor: text;
+     -webkit-user-select: text;
+     user-select: text;
+   }
+   #title {
+     font-size: 18px;
+     font-weight: bold;
+     letter-spacing: 0.08em;
+     align-self: flex-end;
+     max-width: 50vw;
+     white-space: nowrap;
+   }
+   #hud {
+     font-size: 15px;
      text-align: center;
      align-self: center;
      width: 80%;
-     padding: 2px 8px;
-     border-radius: 5px;
      white-space: pre-line;
    }
    #hud u { padding: 0 8px; text-decoration: none;
@@ -70,15 +83,15 @@
    a { color: #59C; }
   </style>
 
-  <script src="gemmimol.js?v=symm-colors-1"></script>
+  <script src="gemmimol.js?v=title-select-7"></script>
   <script src="vendor/wasm/gemmi.js"></script>
 
 </head>
 <body style="background-color: black">
   <div id="viewer"></div>
-  <div id="gm-overlay">
-    <header id="hud" onmousedown="event.stopPropagation();"
-                     ondblclick="event.stopPropagation();"></header>
+  <div id="gm-overlay" onmousedown="event.stopPropagation();">
+    <header id="title"></header>
+    <header id="hud"></header>
   </div>
   <footer id="help"></footer>
   <div id="inset"></div>

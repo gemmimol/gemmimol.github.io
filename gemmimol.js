@@ -12,8 +12,8 @@ typeof define === 'function' && define.amd ? define(['exports'], factory) :
 })(this, (function (exports) { 'use strict';
 
 var VERSION = exports.VERSION = "0.8.3";
-var GIT_DESCRIBE = exports.GIT_DESCRIBE = "0.8.3-22-g29c82ba-dirty";
-var GEMMI_GIT_DESCRIBE = exports.GEMMI_GIT_DESCRIBE = "v0.7.5-141-g3fd5922f";
+var GIT_DESCRIBE = exports.GIT_DESCRIBE = "0.8.3-33-g98eb59e-dirty";
+var GEMMI_GIT_DESCRIBE = exports.GEMMI_GIT_DESCRIBE = "v0.7.5-144-g0445d0c2";
 
 
 const BondType = {
@@ -811,6 +811,16 @@ function _nullishCoalesce$2(lhs, rhsFn) { if (lhs != null) { return lhs; } else 
 
 
 
+
+
+
+
+
+
+
+
+
+
 function modulo(a, b) {
   const reminder = a % b;
   return reminder >= 0 ? reminder : reminder + b;
@@ -900,6 +910,28 @@ class Block {
     return this._values === null;
   }
 
+  field()  {
+    if (this._values == null || this._points == null) return undefined;
+    const size = this._size;
+    if (size[0] < 2 || size[1] < 2 || size[2] < 2) return undefined;
+    const yz = size[1] * size[2];
+    const y = size[2];
+    return {
+      values: this._values,
+      size: [size[0], size[1], size[2]],
+      origin: [this._points[0], this._points[1], this._points[2]],
+      axis_x: [this._points[3*yz] - this._points[0],
+               this._points[3*yz+1] - this._points[1],
+               this._points[3*yz+2] - this._points[2]],
+      axis_y: [this._points[3*y] - this._points[0],
+               this._points[3*y+1] - this._points[1],
+               this._points[3*y+2] - this._points[2]],
+      axis_z: [this._points[3] - this._points[0],
+               this._points[4] - this._points[1],
+               this._points[5] - this._points[2]],
+    };
+  }
+
   isosurface(gemmi_module, isolevel, method='') {
     if (gemmi_module == null) {
       throw Error('Gemmi is required for isosurface extraction.');
@@ -920,12 +952,20 @@ class Block {
       }
       return {
         vertices: iso.vertices().slice(),
-        segments: iso.segments().slice(),
-      };
+        triangles: iso.triangles().slice(),
+        field: this.field(),
+      } ;
     } finally {
       if (iso != null) iso.delete();
     }
   }
+}
+
+function map_index(dim, i, j, k) {
+  i = modulo(i, dim[0]);
+  j = modulo(j, dim[1]);
+  k = modulo(k, dim[2]);
+  return dim[2] * (dim[1] * i + j) + k;
 }
 
 function extract_block_from_grid(block, grid, unit_cell,
@@ -949,6 +989,37 @@ function extract_block_from_grid(block, grid, unit_cell,
         points.push(orth);
         const map_value = grid.get_grid_value(i, j, k);
         values.push(map_value);
+      }
+    }
+  }
+  block.set(points, values, size);
+}
+
+function extract_block_from_map(block, map, unit_cell,
+                                radius, center) {
+  const fc = unit_cell.fractionalize(center);
+  const r = [radius / unit_cell.a,
+             radius / unit_cell.b,
+             radius / unit_cell.c];
+  const dim = [map.nx, map.ny, map.nz];
+  const grid_min = [Math.floor((fc[0] - r[0]) * dim[0]) | 0,
+                          Math.floor((fc[1] - r[1]) * dim[1]) | 0,
+                          Math.floor((fc[2] - r[2]) * dim[2]) | 0];
+  const grid_max = [Math.floor((fc[0] + r[0]) * dim[0]) | 0,
+                          Math.floor((fc[1] + r[1]) * dim[1]) | 0,
+                          Math.floor((fc[2] + r[2]) * dim[2]) | 0];
+  const size = [grid_max[0] - grid_min[0] + 1,
+                      grid_max[1] - grid_min[1] + 1,
+                      grid_max[2] - grid_min[2] + 1];
+  const data = map.data() ;
+  const points = [];
+  const values = [];
+  for (let i = grid_min[0]; i <= grid_max[0]; i++) {
+    for (let j = grid_min[1]; j <= grid_max[1]; j++) {
+      for (let k = grid_min[2]; k <= grid_max[2]; k++) {
+        const frac = [i / dim[0], j / dim[1], k / dim[2]];
+        points.push(unit_cell.orthogonalize(frac));
+        values.push(data[map_index(dim, i, j, k)]);
       }
     }
   }
@@ -1014,13 +1085,19 @@ class ElMap {
     this.set_from_wasm_map(dsn6, gemmi);
   }
 
-  prepare_isosurface(radius, center) {
+  prepare_isosurface(radius, center, want_block=false) {
     this.block_center = center;
     this.block_radius = radius;
-    if (this.wasm_map != null && this.unit_cell != null) return;
-    const grid = this.grid;
     const unit_cell = this.unit_cell;
-    if (grid == null || unit_cell == null) return;
+    if (unit_cell == null) return;
+    if (this.wasm_map != null) {
+      if (want_block) {
+        extract_block_from_map(this.block, this.wasm_map, unit_cell, radius, center);
+      }
+      return;
+    }
+    const grid = this.grid;
+    if (grid == null) return;
     extract_block_from_grid(this.block, grid, unit_cell, radius, center);
   }
 
@@ -1037,7 +1114,8 @@ class ElMap {
       }
       return {
         vertices: this.wasm_map.isosurface_vertices().slice(),
-        segments: this.wasm_map.isosurface_segments().slice(),
+        triangles: this.wasm_map.isosurface_triangles().slice(),
+        field: this.block.field(),
       } ;
     }
     return this.block.isosurface(this.gemmi_module, abs_level, method);
@@ -5655,11 +5733,9 @@ function makeChickenWire(data,
   const position = new Float32Array(data.vertices);
   geom.setAttribute('position', new BufferAttribute(position, 3));
 
-  // Although almost all browsers support OES_element_index_uint nowadays,
-  // use Uint32 indexes only when needed.
-  const arr = (data.vertices.length < 3*65536 ? new Uint16Array(data.segments)
-                                              : new Uint32Array(data.segments));
-  //console.log('arr len:', data.vertices.length, data.segments.length);
+  const vertex_count = data.vertices.length / 3;
+  const arr = wireIndexFromTriangles(data.triangles, vertex_count);
+  //console.log('arr len:', data.vertices.length, data.triangles.length);
   geom.setIndex(new BufferAttribute(arr, 1));
   const material = new ShaderMaterial({
     uniforms: makeUniforms({vcolor: options.color}),
@@ -5674,7 +5750,8 @@ function makeChickenWire(data,
 
 function weldSurface(data) {
   const input_pos = data.vertices;
-  const input_idx = data.segments;
+  const input_idx = data.triangles;
+  const index_len = input_idx.length - input_idx.length % 3;
   const pos = [];
   const remapped = (input_pos.length / 3 < 65536 ? new Uint16Array(input_idx.length)
                                                  : new Uint32Array(input_idx.length));
@@ -5691,18 +5768,61 @@ function weldSurface(data) {
     }
     remapped[i / 3] = idx;
   }
-  const tri = (pos.length < 3*65536 ? new Uint16Array(input_idx.length)
-                                    : new Uint32Array(input_idx.length));
-  for (let i = 0; i < input_idx.length; i++) {
+  const tri = (pos.length < 3*65536 ? new Uint16Array(index_len)
+                                    : new Uint32Array(index_len));
+  for (let i = 0; i < index_len; i++) {
     tri[i] = remapped[input_idx[i]];
   }
   return {
     position: new Float32Array(pos),
-    index: tri,
+    index: cleanSurfaceTriangles(tri, pos.length / 3),
   };
 }
 
-function surfaceNormals(position, index) {
+function cleanSurfaceTriangles(index, vertex_count) {
+  const tri = [];
+  const seen = new Set();
+  for (let i = 0; i + 2 < index.length; i += 3) {
+    const a = index[i];
+    const b = index[i + 1];
+    const c = index[i + 2];
+    if (a >= vertex_count || b >= vertex_count || c >= vertex_count) continue;
+    if (a === b || b === c || c === a) continue;
+    const lo = Math.min(a, b, c);
+    const hi = Math.max(a, b, c);
+    const mid = a + b + c - lo - hi;
+    const key = lo + ',' + mid + ',' + hi;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    tri.push(a, b, c);
+  }
+  return (vertex_count < 65536 ? new Uint16Array(tri)
+                               : new Uint32Array(tri));
+}
+
+function wireIndexFromTriangles(index, vertex_count) {
+  const edges = [];
+  const seen = new Set();
+  for (let i = 0; i + 2 < index.length; i += 3) {
+    const a = index[i];
+    const b = index[i + 1];
+    const c = index[i + 2];
+    if (a >= vertex_count || b >= vertex_count || c >= vertex_count) continue;
+    if (a === b || b === c || c === a) continue;
+    for (const [u, v] of [[a, b], [b, c], [c, a]]) {
+      const lo = Math.min(u, v);
+      const hi = Math.max(u, v);
+      const key = lo + ',' + hi;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      edges.push(u, v);
+    }
+  }
+  return (vertex_count < 65536 ? new Uint16Array(edges)
+                               : new Uint32Array(edges));
+}
+
+function areaSurfaceNormals(position, index) {
   const normal = new Float32Array(position.length);
   for (let i = 0; i + 2 < index.length; i += 3) {
     const i0 = 3 * index[i];
@@ -5739,6 +5859,122 @@ function surfaceNormals(position, index) {
   return normal;
 }
 
+function invertFieldBasis(field) {
+  const ax = field.axis_x;
+  const ay = field.axis_y;
+  const az = field.axis_z;
+  const a00 = ax[0], a01 = ay[0], a02 = az[0];
+  const a10 = ax[1], a11 = ay[1], a12 = az[1];
+  const a20 = ax[2], a21 = ay[2], a22 = az[2];
+  const det = a00 * (a11 * a22 - a12 * a21) -
+              a01 * (a10 * a22 - a12 * a20) +
+              a02 * (a10 * a21 - a11 * a20);
+  if (Math.abs(det) < 1e-12) return null;
+  const inv_det = 1 / det;
+  return [
+    (a11 * a22 - a12 * a21) * inv_det,
+    (a02 * a21 - a01 * a22) * inv_det,
+    (a01 * a12 - a02 * a11) * inv_det,
+    (a12 * a20 - a10 * a22) * inv_det,
+    (a00 * a22 - a02 * a20) * inv_det,
+    (a02 * a10 - a00 * a12) * inv_det,
+    (a10 * a21 - a11 * a20) * inv_det,
+    (a01 * a20 - a00 * a21) * inv_det,
+    (a00 * a11 - a01 * a10) * inv_det,
+  ];
+}
+
+function fieldValue(field, x, y, z) {
+  const size = field.size;
+  x = Math.min(Math.max(x, 0), size[0] - 1);
+  y = Math.min(Math.max(y, 0), size[1] - 1);
+  z = Math.min(Math.max(z, 0), size[2] - 1);
+  const ix = Math.floor(x);
+  const iy = Math.floor(y);
+  const iz = Math.floor(z);
+  const jx = Math.min(ix + 1, size[0] - 1);
+  const jy = Math.min(iy + 1, size[1] - 1);
+  const jz = Math.min(iz + 1, size[2] - 1);
+  const tx = x - ix;
+  const ty = y - iy;
+  const tz = z - iz;
+  const yz = size[1] * size[2];
+  const stride = size[2];
+  const values = field.values;
+  const idx000 = yz * ix + stride * iy + iz;
+  const idx001 = yz * ix + stride * iy + jz;
+  const idx010 = yz * ix + stride * jy + iz;
+  const idx011 = yz * ix + stride * jy + jz;
+  const idx100 = yz * jx + stride * iy + iz;
+  const idx101 = yz * jx + stride * iy + jz;
+  const idx110 = yz * jx + stride * jy + iz;
+  const idx111 = yz * jx + stride * jy + jz;
+  const c00 = values[idx000] * (1 - tx) + values[idx100] * tx;
+  const c01 = values[idx001] * (1 - tx) + values[idx101] * tx;
+  const c10 = values[idx010] * (1 - tx) + values[idx110] * tx;
+  const c11 = values[idx011] * (1 - tx) + values[idx111] * tx;
+  const c0 = c00 * (1 - ty) + c10 * ty;
+  const c1 = c01 * (1 - ty) + c11 * ty;
+  return c0 * (1 - tz) + c1 * tz;
+}
+
+function fieldSurfaceNormals(position, field,
+                             fallback) {
+  if (field.size[0] < 2 || field.size[1] < 2 || field.size[2] < 2) return null;
+  const inv = invertFieldBasis(field);
+  if (inv == null) return null;
+  const origin = field.origin;
+  const normal = new Float32Array(position.length);
+  let valid = 0;
+  let align = 0;
+  for (let i = 0; i < position.length; i += 3) {
+    const dx = position[i] - origin[0];
+    const dy = position[i+1] - origin[1];
+    const dz = position[i+2] - origin[2];
+    const x = inv[0] * dx + inv[1] * dy + inv[2] * dz;
+    const y = inv[3] * dx + inv[4] * dy + inv[5] * dz;
+    const z = inv[6] * dx + inv[7] * dy + inv[8] * dz;
+    const gx = fieldValue(field, x - 1, y, z) - fieldValue(field, x + 1, y, z);
+    const gy = fieldValue(field, x, y - 1, z) - fieldValue(field, x, y + 1, z);
+    const gz = fieldValue(field, x, y, z - 1) - fieldValue(field, x, y, z + 1);
+    let nx = inv[0] * gx + inv[3] * gy + inv[6] * gz;
+    let ny = inv[1] * gx + inv[4] * gy + inv[7] * gz;
+    let nz = inv[2] * gx + inv[5] * gy + inv[8] * gz;
+    const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+    if (len > 1e-12) {
+      nx /= len;
+      ny /= len;
+      nz /= len;
+      normal[i] = nx;
+      normal[i+1] = ny;
+      normal[i+2] = nz;
+      const fx = fallback[i];
+      const fy = fallback[i+1];
+      const fz = fallback[i+2];
+      if (fx !== 0 || fy !== 0 || fz !== 0) {
+        align += nx * fx + ny * fy + nz * fz;
+      }
+      valid++;
+    } else {
+      normal[i] = fallback[i];
+      normal[i+1] = fallback[i+1];
+      normal[i+2] = fallback[i+2];
+    }
+  }
+  if (valid === 0) return null;
+  if (align < 0) {
+    for (let i = 0; i < normal.length; i++) normal[i] = -normal[i];
+  }
+  return normal;
+}
+
+function surfaceNormals(position, index,
+                        field) {
+  const fallback = areaSurfaceNormals(position, index);
+  if (field == null) return fallback;
+  return fieldSurfaceNormals(position, field, fallback) || fallback;
+}
+
 const surface_vert = `
 attribute vec3 normal;
 varying vec3 vnormal;
@@ -5764,11 +6000,12 @@ void main() {
   vec3 view_dir = normalize(vview);
   vec3 light_dir = normalize(lightDir);
   float diffuse = clamp(dot(normal, light_dir), 0.0, 1.0);
-  float rim = pow(1.0 - clamp(dot(normal, view_dir), 0.0, 1.0), 1.7);
-  vec3 base = vcolor * (0.30 + 0.55 * diffuse);
-  vec3 color = mix(base, vec3(1.0), 0.22 * rim);
-  float alpha = opacity * (0.55 + 0.75 * rim);
-  gl_FragColor = vec4(color, alpha);
+  vec3 halfway = normalize(light_dir + view_dir);
+  float specular = pow(clamp(dot(normal, halfway), 0.0, 1.0), 80.0);
+  float fresnel = pow(1.0 - clamp(dot(normal, view_dir), 0.0, 1.0), 3.0);
+  vec3 color = vcolor * (0.22 + 0.78 * diffuse);
+  color += vec3(1.0) * (0.16 * specular + 0.08 * fresnel);
+  gl_FragColor = vec4(color, opacity);
 ${fog_end_fragment}
 }`;
 
@@ -5778,7 +6015,10 @@ function makeSmoothSurface(data,
   const geom = new BufferGeometry();
   geom.setAttribute('position', new BufferAttribute(welded.position, 3));
   geom.setIndex(new BufferAttribute(welded.index, 1));
-  geom.setAttribute('normal', new BufferAttribute(surfaceNormals(welded.position, welded.index), 3));
+  geom.setAttribute('normal',
+                    new BufferAttribute(surfaceNormals(welded.position,
+                                                       welded.index,
+                                                       data.field), 3));
   const material = new ShaderMaterial({
     uniforms: makeUniforms({
       vcolor: options.color,
@@ -7792,6 +8032,7 @@ function _nullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { 
 
 
 
+
 const ColorSchemes$1 = {
   // the default scheme that generally mimicks Coot
   'coot dark': {
@@ -7885,28 +8126,59 @@ function symmetry_mate_color(atom, elem_colors) {
 }
 
 
-const INIT_HUD_TEXT = 'This is GemmiMol not Coot. ' +
-  '<a href="#" onclick="V.toggle_help(); return false;">H shows help.</a>';
+const INIT_HUD_TEXT = 'This is GemmiMol not Coot.';
 
 // options handled by select_next()
 
 const COLOR_PROPS = ['element', 'B-factor', 'pLDDT', 'occupancy',
                      'index', 'chain', 'secondary structure'];
-const RENDER_STYLES = ['sticks', 'lines', 'backbone', 'cartoon', 'cartoon+sticks',
-                       'ribbon', 'ball&stick'];
+const MAINCHAIN_STYLES = ['sticks', 'lines', 'backbone', 'cartoon',
+                          'ribbon', 'ball&stick'];
+const SIDECHAIN_STYLES = ['sticks', 'lines', 'ball&stick', 'invisible'];
 const LIGAND_STYLES = ['ball&stick', 'sticks', 'lines'];
 const WATER_STYLES = ['sphere', 'cross', 'invisible'];
-const MAP_STYLES = ['marching cubes', 'squarish', 'smooth surface'/*, 'snapped MC'*/];
+const MAP_STYLES = ['marching cubes', 'smooth surface'/*, 'snapped MC'*/];
 const LABEL_FONTS = ['bold 14px', '14px', '16px', 'bold 16px'];
+
+
+
+
+
+
+
+function escape_html(text) {
+  return text.replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    '\'': '&#39;',
+  }[ch] || ch));
+}
+
+function help_action_attrs(spec) {
+  let attrs = ' data-help-keycode="' + spec.keyCode + '"';
+  if (spec.shiftKey) attrs += ' data-help-shift="1"';
+  if (spec.ctrlKey) attrs += ' data-help-ctrl="1"';
+  return attrs;
+}
+
+function help_action_link(text, spec) {
+  return '<a href="#" class="gm-help-action"' + help_action_attrs(spec) + '>' +
+         escape_html(text) + '</a>';
+}
 
 function normalize_viewer_options(options) {
   if (typeof options === 'string') return {viewer: options};
-  if (options && typeof options === 'object') return options;
+  if (options && typeof options === 'object') {
+    if (options.map_style === 'squarish') options.map_style = 'marching cubes';
+    return options;
+  }
   return {};
 }
 
 function map_style_method(style) {
-  return style === 'smooth surface' ? 'marching cubes' : style;
+  return style === 'smooth surface' || style === 'squarish' ? 'marching cubes' : style;
 }
 
 function map_style_is_surface(style) {
@@ -8118,7 +8390,10 @@ class ModelBag {
     return color_by(this.conf.color_prop, atoms, this.conf.colors, this.hue_shift);
   }
 
-  add_bonds(polymers, ligands, ball_size) {
+  add_bonds(polymers, ligands, ball_size,
+            atom_filter,
+            bond_filter,
+            wheel_caps=true) {
     const visible_atoms = this.get_visible_atoms();
     const colors = this.atom_colors(visible_atoms);
     const vertex_arr = [];
@@ -8136,6 +8411,7 @@ class ModelBag {
       const atom = visible_atoms[i];
       const color = colors[i];
       if (!(atom.is_ligand ? ligands : polymers)) continue;
+      if (atom_filter && !atom_filter(atom)) continue;
       if (atom.is_water() && this.conf.water_style === 'invisible') continue;
       if (atom.bonds.length === 0 && ball_size == null) { // nonbonded - cross
         if (!atom.is_water() || this.conf.water_style === 'cross') {
@@ -8148,6 +8424,7 @@ class ModelBag {
         for (let j = 0; j < atom.bonds.length; j++) {
           const other = this.model.atoms[atom.bonds[j]];
           if (!hydrogens && other.is_hydrogen()) continue;
+          if (bond_filter && !bond_filter(atom, other)) continue;
           // Coot show X-H bonds as thinner lines in a single color.
           // Here we keep it simple and render such bonds like all others.
           const bond_type = atom.bond_types[j];
@@ -8213,8 +8490,10 @@ class ModelBag {
         metal_obj.userData.bond_types = metal_bond_type_arr;
         this.objects.push(metal_obj);
       }
-      // wheels (discs) as round caps
-      this.objects.push(makeWheels(sphere_arr, sphere_color_arr, linewidth));
+      if (wheel_caps && sphere_arr.length !== 0) {
+        // wheels (discs) as round caps
+        this.objects.push(makeWheels(sphere_arr, sphere_color_arr, linewidth));
+      }
     }
     if (water_sphere_arr.length !== 0) {
       this.objects.push(makeBalls(water_sphere_arr, water_sphere_color_arr,
@@ -8226,7 +8505,8 @@ class ModelBag {
   }
 
   add_sticks(polymers, ligands, radius,
-             atom_filter) {
+             atom_filter,
+             bond_filter) {
     const visible_atoms = this.get_visible_atoms();
     const colors = this.atom_colors(visible_atoms);
     const vertex_arr = [];
@@ -8254,6 +8534,7 @@ class ModelBag {
       for (let j = 0; j < atom.bonds.length; j++) {
         const other = this.model.atoms[atom.bonds[j]];
         if (!hydrogens && other.is_hydrogen()) continue;
+        if (bond_filter && !bond_filter(atom, other)) continue;
         const bond_type = atom.bond_types[j];
         if (bond_type === BondType.Metal) {
           const mid = this.bond_half_end(atom, other, radius * 0.5);
@@ -8568,6 +8849,14 @@ class Viewer {
   
   
   
+  
+  
+  
+  
+  
+  
+  
+  
 
   constructor(options = {}) {
     options = normalize_viewer_options(options);
@@ -8599,7 +8888,8 @@ class Viewer {
       default_isolevel: 1.5,
       center_cube_size: 0.1,
       map_style: MAP_STYLES[0],
-      render_style: RENDER_STYLES[0],
+      mainchain_style: 'sticks',
+      sidechain_style: 'sticks',
       ligand_style: LIGAND_STYLES[0],
       water_style: WATER_STYLES[0],
       color_prop: COLOR_PROPS[0],
@@ -8656,8 +8946,14 @@ class Viewer {
       return document.getElementById(options[name] || name);
     }
     this.hud_el = get_elem('hud');
+    if (this.hud_el) {
+      this.hud_el.addEventListener('click', this.on_hud_click.bind(this));
+    }
     this.container = get_elem('viewer');
     this.help_el = get_elem('help');
+    if (this.help_el) {
+      this.help_el.addEventListener('click', this.on_help_click.bind(this));
+    }
     this.structure_name_el = null;
     this.cid_dialog_el = null;
     this.cid_input_el = null;
@@ -8671,6 +8967,14 @@ class Viewer {
     this.download_select_el = null;
     this.delete_select_el = null;
     this.mutate_select_el = null;
+    this.mutate_button_el = null;
+    this.mutate_list_el = null;
+    this.mutate_targets = [];
+    this.mutate_open = false;
+    this.mutate_select_target = null;
+    this.mutate_select_residue_key = null;
+    this.mutate_select_busy = false;
+    this.queued_mutation_preview = null;
     this.histogram_el = null;
     this.histogram_redraw = null;
     this.blob_hits = [];
@@ -8709,6 +9013,7 @@ class Viewer {
     const el = this.renderer.domElement;
     this.container.appendChild(el);
     this.create_structure_name_badge();
+    this.create_help_toggle_link();
     if (options.focusable) {
       el.tabIndex = 0;
     }
@@ -8760,21 +9065,52 @@ class Viewer {
 
   create_structure_name_badge() {
     if (this.container == null || typeof document === 'undefined') return;
-    const el = document.createElement('div');
+    const el = document.createElement('header');
     el.style.display = 'none';
     el.style.fontSize = '18px';
     el.style.color = '#ddd';
     el.style.backgroundColor = 'rgba(0,0,0,0.6)';
-    el.style.position = 'absolute';
-    el.style.top = '10px';
-    el.style.right = '10px';
-    el.style.padding = '3px 10px';
+    el.style.textAlign = 'right';
+    el.style.alignSelf = 'stretch';
+    el.style.padding = '3px 8px';
     el.style.borderRadius = '5px';
     el.style.letterSpacing = '0.08em';
     el.style.fontWeight = 'bold';
-    el.style.pointerEvents = 'none';
-    this.container.appendChild(el);
+    el.style.pointerEvents = 'auto'; // ensure selectability
+    el.style.cursor = 'text';        // ensure selectability
+    el.style.userSelect = 'text';    // ensure selectability
+    el.style.webkitUserSelect = 'text'; // ensure selectability
+    el.onmousedown = (evt) => evt.stopPropagation();
+    const overlay = document.getElementById('gm-overlay');
+    if (overlay) overlay.insertBefore(el, overlay.firstChild);
+    else this.container.appendChild(el);
     this.structure_name_el = el;
+  }
+
+  create_help_toggle_link() {
+    if (this.container == null || this.help_el == null || typeof document === 'undefined') return;
+    const el = document.createElement('a');
+    el.className = 'gm-help-toggle';
+    el.href = '#';
+    el.textContent = 'H = toggle help';
+    el.style.fontSize = '13px';
+    el.style.color = '#9dd3ff';
+    el.style.backgroundColor = 'rgba(0,0,0,0.65)';
+    el.style.alignSelf = 'flex-end';
+    el.style.padding = '2px 8px';
+    el.style.borderRadius = '999px';
+    el.style.textDecoration = 'underline';
+    el.style.textUnderlineOffset = '2px';
+    el.style.cursor = 'pointer';
+    el.style.pointerEvents = 'auto';
+    el.onclick = (evt) => {
+      evt.preventDefault();
+      evt.stopPropagation();
+      this.toggle_help();
+    };
+    const overlay = _optionalChain([this, 'access', _ => _.hud_el, 'optionalAccess', _2 => _2.parentElement]) || document.getElementById('gm-overlay');
+    if (overlay) overlay.insertBefore(el, this.hud_el || overlay.firstChild);
+    else this.container.appendChild(el);
   }
 
   set_structure_name(name) {
@@ -9019,25 +9355,54 @@ class Viewer {
     }
   }
 
+  add_rendered_atoms(target, seen, atoms) {
+    for (const atom of atoms) {
+      if (!seen.has(atom.i_seq)) {
+        seen.add(atom.i_seq);
+        target.push(atom);
+      }
+    }
+  }
+
+  is_atom_visible_in_current_style(atom, conf) {
+    if (atom.is_water()) return conf.water_style !== 'invisible';
+    if (atom.is_ligand) return true;
+    return atom.is_backbone() || conf.sidechain_style !== 'invisible';
+  }
+
+  atom_style_key(atom) {
+    if (atom.is_water()) return 'water_style';
+    if (atom.is_ligand) return 'ligand_style';
+    return atom.is_backbone() ? 'mainchain_style' : 'sidechain_style';
+  }
+
   set_model_objects(model_bag) {
     model_bag.objects = [];
     model_bag.atom_array = [];
+    const rendered_atoms = [];
+    const seen_atoms = new Set();
+    const finish_pass = () => {
+      this.add_rendered_atoms(rendered_atoms, seen_atoms, model_bag.atom_array);
+      model_bag.atom_array = [];
+    };
+    const partner_visible = (_atom, other) =>
+      this.is_atom_visible_in_current_style(other, model_bag.conf);
     let ligand_balls = null;
     const ligand_sticks = (model_bag.conf.ligand_style === 'sticks');
     if (model_bag.conf.ligand_style === 'ball&stick' && this.has_frag_depth()) {
       ligand_balls = this.config.ball_size;
     }
-    switch (model_bag.conf.render_style) {
+    const mainchain_style = model_bag.conf.mainchain_style;
+    const sidechain_style = model_bag.conf.sidechain_style;
+    const wheel_caps = (mainchain_style === 'lines' &&
+                        sidechain_style === 'lines' &&
+                        model_bag.conf.ligand_style === 'lines');
+    const mainchain_filter = (atom) => atom.is_backbone();
+    const sidechain_filter = (atom) => !atom.is_backbone();
+    switch (mainchain_style) {
       case 'lines':
-        if (ligand_balls === null && !ligand_sticks) {
-          model_bag.add_bonds(true, true);
-        } else if (ligand_sticks) {
-          model_bag.add_bonds(true, false);
-          model_bag.add_sticks(false, true, this.config.stick_radius);
-        } else {
-          model_bag.add_bonds(true, false);
-          model_bag.add_bonds(false, true, ligand_balls);
-        }
+        model_bag.add_bonds(true, false, undefined, mainchain_filter, partner_visible, wheel_caps);
+        finish_pass();
         break;
       case 'sticks':
         if (!this.has_frag_depth()) {
@@ -9045,7 +9410,9 @@ class Viewer {
                    '\ndue to lack of suppport for EXT_frag_depth', 'ERR');
           return;
         }
-        model_bag.add_sticks(true, true, this.config.stick_radius);
+        model_bag.add_sticks(true, false, this.config.stick_radius,
+                             mainchain_filter, partner_visible);
+        finish_pass();
         break;
       case 'ball&stick':
         if (!this.has_frag_depth()) {
@@ -9053,49 +9420,47 @@ class Viewer {
                    '\ndue to lack of suppport for EXT_frag_depth', 'ERR');
           return;
         }
-        if (ligand_balls === null) {
-          model_bag.add_bonds(true, false, this.config.ball_size);
-          model_bag.add_bonds(false, true);
-        } else {
-          model_bag.add_bonds(true, true, this.config.ball_size);
-        }
+        model_bag.add_bonds(true, false, this.config.ball_size,
+                            mainchain_filter, partner_visible);
+        finish_pass();
         break;
       case 'backbone':
         model_bag.add_trace();
-        if (ligand_sticks) {
-          model_bag.add_sticks(false, true, this.config.stick_radius);
-        } else {
-          model_bag.add_bonds(false, true, ligand_balls);
-        }
+        finish_pass();
         break;
       case 'ribbon':
         model_bag.add_ribbon(8);
-        if (ligand_sticks) {
-          model_bag.add_sticks(false, true, this.config.stick_radius);
-        } else {
-          model_bag.add_bonds(false, true, ligand_balls);
-        }
+        finish_pass();
         break;
       case 'cartoon':
         model_bag.add_cartoon(8);
-        if (ligand_sticks) {
-          model_bag.add_sticks(false, true, this.config.stick_radius);
-        } else {
-          model_bag.add_bonds(false, true, ligand_balls);
-        }
-        break;
-      case 'cartoon+sticks':
-        model_bag.add_cartoon(8);
-        model_bag.add_sticks(true, false, this.config.stick_radius,
-                             (atom) => !atom.is_backbone());
-        if (ligand_sticks) {
-          model_bag.add_sticks(false, true, this.config.stick_radius);
-        } else {
-          model_bag.add_bonds(false, true, ligand_balls);
-        }
-        model_bag.atom_array = model_bag.get_visible_atoms();
+        finish_pass();
         break;
     }
+    switch (sidechain_style) {
+      case 'lines':
+        model_bag.add_bonds(true, false, undefined, sidechain_filter, partner_visible, wheel_caps);
+        finish_pass();
+        break;
+      case 'sticks':
+        model_bag.add_sticks(true, false, this.config.stick_radius,
+                             sidechain_filter, partner_visible);
+        finish_pass();
+        break;
+      case 'ball&stick':
+        model_bag.add_bonds(true, false, this.has_frag_depth() ? this.config.ball_size : undefined,
+                            sidechain_filter, partner_visible);
+        finish_pass();
+        break;
+    }
+    if (ligand_sticks) {
+      model_bag.add_sticks(false, true, this.config.stick_radius);
+      finish_pass();
+    } else {
+      model_bag.add_bonds(false, true, ligand_balls, undefined, undefined, wheel_caps);
+      finish_pass();
+    }
+    model_bag.atom_array = rendered_atoms;
     for (const o of model_bag.objects) {
       this.scene.add(o);
     }
@@ -9111,7 +9476,7 @@ class Viewer {
     if (show === undefined) show = !is_shown;
     if (show) {
       if (is_shown) return;
-      const atom_style = pick.atom.is_ligand ? 'ligand_style' : 'render_style';
+      const atom_style = this.atom_style_key(pick.atom);
       const balls = pick.bag && pick.bag.conf[atom_style] === 'ball&stick';
       const label = new Label(text, {
         pos: pick.atom.xyz,
@@ -9187,7 +9552,8 @@ class Viewer {
     if (map_bag.map.block.empty()) {
       const t = this.target;
       map_bag.block_ctr.copy(t);
-      map_bag.map.prepare_isosurface(this.config.map_radius, [t.x, t.y, t.z]);
+      map_bag.map.prepare_isosurface(this.config.map_radius, [t.x, t.y, t.z],
+                                     map_style_is_surface(this.config.map_style));
     }
     for (const mtype of map_bag.types) {
       const isolevel = (mtype === 'map_neg' ? -1 : 1) * map_bag.isolevel;
@@ -9197,7 +9563,7 @@ class Viewer {
       const obj = map_style_is_surface(this.config.map_style) ?
         makeSmoothSurface(iso, {
           color: this.config.colors[mtype],
-          opacity: 0.22,
+          opacity: 0.5,
         }) :
         makeChickenWire(iso, {
           color: this.config.colors[mtype],
@@ -9736,27 +10102,73 @@ class Viewer {
   }
 
   create_mutate_select() {
-    const select = document.createElement('select');
-    select.style.padding = '3px 6px';
-    select.style.borderRadius = '4px';
-    select.style.border = '1px solid #666';
-    select.style.backgroundColor = 'rgba(0, 28, 56, 0.9)';
-    select.style.color = '#d6e8ff';
-    select.style.fontSize = '13px';
-    select.style.display = 'none';
-    const header = document.createElement('option');
-    header.textContent = 'Mutate';
-    header.value = '';
-    header.selected = true;
-    select.appendChild(header);
-    select.addEventListener('change', () => {
-      if (select.value !== '') this.mutate_selected_residue(select.value);
-      select.value = '';
-    });
-    select.addEventListener('keydown', (evt) => {
+    const wrapper = document.createElement('div');
+    wrapper.style.position = 'relative';
+    wrapper.style.display = 'none';
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = 'Mutate';
+    button.style.padding = '3px 6px';
+    button.style.borderRadius = '4px';
+    button.style.border = '1px solid #666';
+    button.style.backgroundColor = 'rgba(0, 28, 56, 0.9)';
+    button.style.color = '#d6e8ff';
+    button.style.fontSize = '13px';
+    button.style.minWidth = '84px';
+    button.style.textAlign = 'left';
+    button.style.cursor = 'pointer';
+
+    const list = document.createElement('div');
+    list.style.position = 'absolute';
+    list.style.left = '0';
+    list.style.top = 'calc(100% + 2px)';
+    list.style.minWidth = '100%';
+    list.style.maxHeight = '280px';
+    list.style.overflowY = 'auto';
+    list.style.borderRadius = '4px';
+    list.style.border = '1px solid #666';
+    list.style.backgroundColor = 'rgba(0, 28, 56, 0.96)';
+    list.style.boxShadow = '0 4px 10px rgba(0, 0, 0, 0.35)';
+    list.style.zIndex = '20';
+    list.style.display = 'none';
+
+    wrapper.appendChild(button);
+    wrapper.appendChild(list);
+    this.mutate_button_el = button;
+    this.mutate_list_el = list;
+
+    button.addEventListener('click', (evt) => {
       evt.stopPropagation();
+      if (button.disabled) return;
+      this.set_mutate_menu_open(!this.mutate_open);
     });
-    return select;
+    button.addEventListener('keydown', (evt) => {
+      evt.stopPropagation();
+      if (evt.key === 'ArrowDown' || evt.key === 'ArrowUp') {
+        evt.preventDefault();
+        if (this.mutate_targets.length === 0) return;
+        this.set_mutate_menu_open(true);
+        const next = this.mutation_target_step(this.mutate_targets,
+                                               this.mutate_select_target || '',
+                                               evt.key === 'ArrowDown' ? 1 : -1);
+        if (next == null) return;
+        this.mutate_select_target = next;
+        this.sync_mutate_menu_ui();
+        this.request_mutation_preview(next);
+      } else if (evt.key === 'Enter' || evt.key === ' ') {
+        evt.preventDefault();
+        if (!button.disabled) this.set_mutate_menu_open(!this.mutate_open);
+      } else if (evt.key === 'Escape') {
+        evt.preventDefault();
+        this.set_mutate_menu_open(false);
+      }
+    });
+    wrapper.addEventListener('focusout', (evt) => {
+      const next = evt.relatedTarget ;
+      if (next == null || !wrapper.contains(next)) this.set_mutate_menu_open(false);
+    });
+    return wrapper;
   }
 
   active_model_bag(preferred) {
@@ -9769,7 +10181,7 @@ class Viewer {
 
   create_metals_menu() {
     if (typeof document === 'undefined' || this.container == null) return;
-    const overlay = _optionalChain([this, 'access', _ => _.hud_el, 'optionalAccess', _2 => _2.parentElement]);
+    const overlay = _optionalChain([this, 'access', _3 => _3.hud_el, 'optionalAccess', _4 => _4.parentElement]);
     if (overlay == null) return;
     const row1 = document.createElement('div');
     row1.style.display = 'flex';
@@ -10282,30 +10694,132 @@ class Viewer {
     select.value = '';
   }
 
+  mutation_target_from_resname(resname) {
+    const upper = resname.toUpperCase();
+    if (upper === 'A' || upper === 'C' || upper === 'G' || upper === 'U') return upper;
+    if (upper === 'DA' || upper === 'DC' || upper === 'DG' || upper === 'DT') return upper.slice(1);
+    return upper;
+  }
+
+  edit_target_key(edit) {
+    return this.model_bags.indexOf(edit.bag) + ':' + edit.atom.chain + ':' + edit.atom.seqid;
+  }
+
+  mutation_target_step(targets, current_target, dir) {
+    if (targets.length === 0) return null;
+    let index = targets.indexOf(current_target);
+    if (index === -1) {
+      return dir < 0 ? null : targets[0];
+    }
+    const next_index = Math.max(0, Math.min(targets.length - 1, index + dir));
+    if (next_index === index) return null;
+    return targets[next_index];
+  }
+
+  set_mutate_menu_open(open) {
+    this.mutate_open = open && this.mutate_targets.length > 0;
+    this.sync_mutate_menu_ui();
+  }
+
+  sync_mutate_menu_ui() {
+    const button = this.mutate_button_el;
+    const list = this.mutate_list_el;
+    if (button == null || list == null) return;
+    button.textContent = this.mutate_select_target ? ('Mutate: ' + this.mutate_select_target) : 'Mutate';
+    button.setAttribute('aria-expanded', this.mutate_open ? 'true' : 'false');
+    list.style.display = this.mutate_open ? '' : 'none';
+    for (const child of Array.from(list.children)) {
+      if (!(child instanceof HTMLButtonElement)) continue;
+      const active = child.dataset.target === this.mutate_select_target;
+      child.style.backgroundColor = active ? 'rgba(90, 145, 210, 0.35)' : 'transparent';
+    }
+  }
+
+  request_mutation_preview(target_resname) {
+    if (target_resname === '') return;
+    const edit = this.current_edit_target();
+    if (edit == null) return;
+    const residue_key = this.edit_target_key(edit);
+    const current_target = this.mutation_target_from_resname(edit.atom.resname);
+    this.mutate_select_target = target_resname;
+    this.mutate_select_residue_key = residue_key;
+    if (this.mutate_select_busy) {
+      this.queued_mutation_preview = {target: target_resname, residue_key: residue_key};
+      return;
+    }
+    if (target_resname === current_target) return;
+    this.mutate_select_busy = true;
+    Promise.resolve(this.mutate_selected_residue(target_resname)).finally(() => {
+      this.mutate_select_busy = false;
+      const queued = this.queued_mutation_preview;
+      this.queued_mutation_preview = null;
+      if (queued == null) return;
+      const next_edit = this.current_edit_target();
+      if (next_edit == null || this.edit_target_key(next_edit) !== queued.residue_key) return;
+      if (this.mutation_target_from_resname(next_edit.atom.resname) === queued.target) {
+        this.mutate_select_target = queued.target;
+        return;
+      }
+      this.request_mutation_preview(queued.target);
+    });
+  }
+
   update_mutate_select(select) {
     if (select == null) return;
     const editable_bag = this.editable_model_bag();
     const edit = this.current_edit_target();
-    select.innerHTML = '';
-    const header = document.createElement('option');
+    const button = this.mutate_button_el;
+    const list = this.mutate_list_el;
+    if (button == null || list == null) return;
+    const residue_key = edit == null ? null : this.edit_target_key(edit);
+    const same_residue = (residue_key != null && residue_key === this.mutate_select_residue_key);
+    const preferred_target = same_residue ? (this.mutate_select_target || '') : '';
     let targets = [];
     if (edit != null) {
       const residue_atoms = edit.bag.model.get_residues()[edit.atom.resid()] || [edit.atom];
       targets = mutation_targets_for_residue(residue_atoms);
     }
-    header.textContent = targets.length === 0 ? 'Mutate' : 'Mutate';
-    header.value = '';
-    header.selected = true;
-    select.appendChild(header);
+    this.mutate_targets = targets;
+    if (!same_residue) this.mutate_open = false;
+    list.innerHTML = '';
     for (const target of targets) {
-      const opt = document.createElement('option');
-      opt.textContent = target;
-      opt.value = target;
-      select.appendChild(opt);
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.tabIndex = -1;
+      item.dataset.target = target;
+      item.textContent = target;
+      item.style.display = 'block';
+      item.style.width = '100%';
+      item.style.padding = '3px 8px';
+      item.style.border = '0';
+      item.style.backgroundColor = 'transparent';
+      item.style.color = '#d6e8ff';
+      item.style.fontSize = '13px';
+      item.style.textAlign = 'left';
+      item.style.cursor = 'pointer';
+      item.addEventListener('mousedown', (evt) => {
+        evt.preventDefault();
+      });
+      item.addEventListener('click', (evt) => {
+        evt.stopPropagation();
+        this.mutate_select_target = target;
+        this.sync_mutate_menu_ui();
+        this.request_mutation_preview(target);
+        _optionalChain([this, 'access', _5 => _5.mutate_button_el, 'optionalAccess', _6 => _6.focus, 'call', _7 => _7()]);
+      });
+      list.appendChild(item);
     }
-    select.disabled = (edit == null || targets.length === 0);
+    button.disabled = (edit == null || targets.length === 0);
+    button.style.opacity = button.disabled ? '0.7' : '1';
+    button.style.cursor = button.disabled ? 'default' : 'pointer';
     select.style.display = (editable_bag == null) ? 'none' : '';
-    select.value = '';
+    const current_target = edit == null ? '' : this.mutation_target_from_resname(edit.atom.resname);
+    const value = targets.indexOf(preferred_target) !== -1 ? preferred_target :
+      (targets.indexOf(current_target) !== -1 ? current_target : '');
+    if (value === '' && targets.length === 0) this.mutate_open = false;
+    this.mutate_select_residue_key = residue_key;
+    this.mutate_select_target = value === '' ? null : value;
+    this.sync_mutate_menu_ui();
   }
 
   unresolved_monomer_message() {
@@ -11258,6 +11772,94 @@ class Viewer {
                     this.ABOUT_HELP, this.fps_text].join('\n\n');
   }
 
+  trigger_help_action(keyCode, shiftKey=false, ctrlKey=false) {
+    this.keydown({
+      keyCode: keyCode,
+      shiftKey: shiftKey,
+      ctrlKey: ctrlKey,
+      preventDefault() {},
+    } );
+  }
+
+  on_help_click(event) {
+    let el = event.target ;
+    while (el && el !== this.help_el) {
+      const keycode = el.getAttribute('data-help-keycode');
+      if (keycode != null) {
+        event.preventDefault();
+        event.stopPropagation();
+        this.trigger_help_action(
+          parseInt(keycode, 10),
+          el.getAttribute('data-help-shift') === '1',
+          el.getAttribute('data-help-ctrl') === '1'
+        );
+        return;
+      }
+      el = el.parentElement;
+    }
+  }
+
+  select_menu_html(info, key, options) {
+    const value = this.config[key];
+    const encoded_options = JSON.stringify(options);
+    let html = escape_html(info) + ':';
+    for (const option of options) {
+      const tag = (option === value ? 'u' : 's');
+      html += ' <a href="#" class="gm-hud-option" data-hud-select-key="' + escape_html(key) +
+              '" data-hud-select-value="' + escape_html(option) +
+              '" data-hud-select-info="' + escape_html(info) +
+              '" data-hud-select-options="' + escape_html(encoded_options) + '">' +
+              '<' + tag + '>' + escape_html(option) + '</' + tag + '></a>';
+    }
+    return html;
+  }
+
+  apply_selected_option(key) {
+    switch (key) {
+      case 'color_scheme':
+        this.set_colors();
+        break;
+      case 'color_prop':
+      case 'mainchain_style':
+      case 'sidechain_style':
+      case 'ligand_style':
+      case 'water_style':
+        this.redraw_models();
+        break;
+      case 'label_font':
+        this.redraw_labels();
+        break;
+      case 'map_style':
+        this.redraw_maps(true);
+        break;
+    }
+    this.request_render();
+  }
+
+  set_selected_option(info, key, options, value) {
+    if (options.indexOf(value) === -1) return;
+    this.config[key] = value;
+    this.apply_selected_option(key);
+    this.hud(this.select_menu_html(info, key, options), 'HTML');
+  }
+
+  on_hud_click(event) {
+    let el = event.target ;
+    while (el && el !== this.hud_el) {
+      const key = el.getAttribute('data-hud-select-key');
+      if (key != null) {
+        event.preventDefault();
+        event.stopPropagation();
+        const value = el.getAttribute('data-hud-select-value') || '';
+        const info = el.getAttribute('data-hud-select-info') || key;
+        const options = JSON.parse(el.getAttribute('data-hud-select-options') || '[]');
+        this.set_selected_option(info, key, options, value);
+        return;
+      }
+      el = el.parentElement;
+    }
+  }
+
   update_fps() {
     const now = performance.now();
     if (this.last_frame_time !== 0) {
@@ -11280,13 +11882,7 @@ class Viewer {
     const old_idx = options.indexOf(this.config[key]);
     const len = options.length;
     const new_idx = (old_idx + (back ? len - 1 : 1)) % len;
-    this.config[key] = options[new_idx];
-    let html = info + ':';
-    for (let i = 0; i < len; i++) {
-      const tag = (i === new_idx ? 'u' : 's');
-      html += ' <' + tag + '>' + options[i] + '</' + tag + '>';
-    }
-    this.hud(html, 'HTML');
+    this.set_selected_option(info, key, options, options[new_idx]);
   }
 
   keydown(evt) {
@@ -11340,14 +11936,6 @@ class Viewer {
     kb[75] = function () {
       this.hud('toggled rocking');
       this.controls.toggle_auto(0.0);
-    };
-    // m
-    kb[77] = function ( evt) {
-      this.change_zoom_by_factor(evt.shiftKey ? 1.2 : 1.03);
-    };
-    // n
-    kb[78] = function ( evt) {
-      this.change_zoom_by_factor(1 / (evt.shiftKey ? 1.2 : 1.03));
     };
     // q
     kb[81] = function ( evt) {
@@ -11436,9 +12024,14 @@ class Viewer {
         this.go_to_nearest_Ca();
       }
     };
+    // m
+    kb[77] = function ( evt) {
+      this.select_next('mainchain as', 'mainchain_style', MAINCHAIN_STYLES, evt.shiftKey);
+      this.redraw_models();
+    };
     // s
     kb[83] = function ( evt) {
-      this.select_next('rendering as', 'render_style', RENDER_STYLES, evt.shiftKey);
+      this.select_next('sidechains as', 'sidechain_style', SIDECHAIN_STYLES, evt.shiftKey);
       this.redraw_models();
     };
     // t
@@ -12350,35 +12943,40 @@ Viewer.prototype.MOUSE_HELP = [
 
 Viewer.prototype.KEYBOARD_HELP = [
   '<b>keyboard:</b>',
-  'H = toggle help',
-  'S = general style',
-  'L = ligand style',
-  'T = water style',
-  'C = coloring',
-  'B = bg color',
-  'E = toggle fog',
-  'Q = label font',
-  '+/- = sigma level',
-  ']/[ = map radius',
-  'D/F = clip width',
-  '&lt;/> = move clip',
-  'M/N = zoom',
-  'U = unitcell box',
-  '\\ = toggle symmetry',
-  'Y = hydrogens',
-  'V = inactive models',
-  'R = center view',
-  'G = density histogram',
-  'W = density style',
-  'I = spin',
-  'K = rock',
-  'Home/End = stick width',
-  'P = nearest Cα',
-  'Ctrl+G = go to CID',
+  help_action_link('M = mainchain style', {keyCode: 77}),
+  help_action_link('S = sidechain style', {keyCode: 83}),
+  help_action_link('L = ligand style', {keyCode: 76}),
+  help_action_link('T = water style', {keyCode: 84}),
+  help_action_link('C = coloring', {keyCode: 67}),
+  help_action_link('B = bg color', {keyCode: 66}),
+  help_action_link('E = toggle fog', {keyCode: 69}),
+  help_action_link('Q = label font', {keyCode: 81}),
+  help_action_link('+ = sigma level up', {keyCode: 187}),
+  help_action_link('- = sigma level down', {keyCode: 189}),
+  help_action_link('] = larger map radius', {keyCode: 221}),
+  help_action_link('[ = smaller map radius', {keyCode: 219}),
+  help_action_link('D = narrower clip', {keyCode: 68}),
+  help_action_link('F = wider clip', {keyCode: 70}),
+  help_action_link('Shift+, = move clip', {keyCode: 188, shiftKey: true}),
+  help_action_link('Shift+. = move clip', {keyCode: 190, shiftKey: true}),
+  help_action_link('U = unitcell box', {keyCode: 85}),
+  help_action_link('\\ = toggle symmetry', {keyCode: 220}),
+  help_action_link('Y = hydrogens', {keyCode: 89}),
+  help_action_link('V = inactive models', {keyCode: 86}),
+  help_action_link('R = center view', {keyCode: 82}),
+  help_action_link('G = density histogram', {keyCode: 71}),
+  help_action_link('W = density style', {keyCode: 87}),
+  help_action_link('I = spin', {keyCode: 73}),
+  help_action_link('K = rock', {keyCode: 75}),
+  help_action_link('Home = wider sticks', {keyCode: 36}),
+  help_action_link('End = thinner sticks', {keyCode: 35}),
+  help_action_link('P = nearest Cα', {keyCode: 80}),
+  help_action_link('Ctrl+G = go to CID', {keyCode: 71, ctrlKey: true}),
   'Delete menu = selected atom/residue/chain',
-  'Shift+P = permalink',
-  '(Shift+)space = next res.',
-  'Shift+F = full screen',
+  help_action_link('Shift+P = permalink', {keyCode: 80, shiftKey: true}),
+  help_action_link('Space = next residue', {keyCode: 32}),
+  help_action_link('Shift+Space = previous residue', {keyCode: 32, shiftKey: true}),
+  help_action_link('Shift+F = full screen', {keyCode: 70, shiftKey: true}),
 ].join('\n');
 
 Viewer.prototype.ABOUT_HELP =
@@ -12440,7 +13038,7 @@ class ReciprocalSpaceMap extends ElMap {
     this.unit_cell = null;
   }
 
-  prepare_isosurface(radius, center) {
+  prepare_isosurface(radius, center, _want_block=false) {
     const grid = this.grid;
     if (grid == null) return;
     const b = this.box_size;
@@ -12880,6 +13478,28 @@ class ReciprocalViewer extends Viewer {
     this.set_points(this.data);
   }
 
+  apply_selected_option(key) {
+    switch (key) {
+      case 'show_axes':
+        this.set_axes();
+        break;
+      case 'spot_shape':
+        this.point_material.fragmentShader = this.config.spot_shape === 'wheel' ?
+          round_point_frag : square_point_frag;
+        this.point_material.needsUpdate = true;
+        break;
+      case 'show_only': {
+        const idx = SPOT_SEL.indexOf(this.config.show_only);
+        this.point_material.uniforms.show_only.value = idx - 2;
+        break;
+      }
+      default:
+        super.apply_selected_option(key);
+        return;
+    }
+    this.request_render();
+  }
+
   get_cell_box_func() {
     if (this.map_bags.length === 0) return null;
     // here the map is ReciprocalSpaceMap not ElMap
@@ -12892,23 +13512,29 @@ class ReciprocalViewer extends Viewer {
 
 ReciprocalViewer.prototype.KEYBOARD_HELP = [
   '<b>keyboard:</b>',
-  'H = toggle help',
-  'V = show (un)indexed',
-  'A = toggle axes',
-  'U = toggle map box',
-  'B = bg color',
-  'E = toggle fog',
-  'M/N = zoom',
-  'D/F = clip width',
-  '&lt;/> = move clip',
-  'R = center view',
-  'Z/X = point size',
-  'S = point shape',
-  'Shift+P = permalink',
-  'Shift+F = full screen',
-  '←/→ = max resol.',
-  '↑/↓ = min resol.',
-  '+/- = map level',
+  help_action_link('V = show (un)indexed', {keyCode: 86}),
+  help_action_link('A = toggle axes', {keyCode: 65}),
+  help_action_link('U = toggle map box', {keyCode: 85}),
+  help_action_link('B = bg color', {keyCode: 66}),
+  help_action_link('E = toggle fog', {keyCode: 69}),
+  help_action_link('M = zoom in', {keyCode: 77}),
+  help_action_link('N = zoom out', {keyCode: 78}),
+  help_action_link('D = narrower clip', {keyCode: 68}),
+  help_action_link('F = wider clip', {keyCode: 70}),
+  help_action_link('Shift+, = move clip', {keyCode: 188, shiftKey: true}),
+  help_action_link('Shift+. = move clip', {keyCode: 190, shiftKey: true}),
+  help_action_link('R = center view', {keyCode: 82}),
+  help_action_link('Z = smaller points', {keyCode: 90}),
+  help_action_link('X = larger points', {keyCode: 88}),
+  help_action_link('S = point shape', {keyCode: 83}),
+  help_action_link('P = permalink', {keyCode: 80}),
+  help_action_link('Shift+F = full screen', {keyCode: 70, shiftKey: true}),
+  help_action_link('← = lower max resolution', {keyCode: 37}),
+  help_action_link('→ = higher max resolution', {keyCode: 39}),
+  help_action_link('↑ = higher min resolution', {keyCode: 38}),
+  help_action_link('↓ = lower min resolution', {keyCode: 40}),
+  help_action_link('+ = map level up', {keyCode: 187}),
+  help_action_link('- = map level down', {keyCode: 189}),
 ].join('\n');
 
 ReciprocalViewer.prototype.MOUSE_HELP =
@@ -13050,6 +13676,7 @@ exports.addXyzCross = addXyzCross;
 exports.bondDataFromGemmiStructure = bondDataFromGemmiStructure;
 exports.fog_end_fragment = fog_end_fragment;
 exports.fog_pars_fragment = fog_pars_fragment;
+exports.help_action_link = help_action_link;
 exports.load_maps_from_mtz = load_maps_from_mtz;
 exports.load_maps_from_mtz_buffer = load_maps_from_mtz_buffer;
 exports.makeBalls = makeBalls;
