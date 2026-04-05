@@ -1,5 +1,5 @@
 /*!
- * GemmiMol v0.8.3. Macromolecular Viewer for Crystallographers.
+ * GemmiMol v0.8.4. Macromolecular Viewer for Crystallographers.
  * Copyright 2014 Nat Echols
  * Copyright 2016 Diamond Light Source Ltd
  * Copyright 2016 Marcin Wojdyr
@@ -11,8 +11,8 @@ typeof define === 'function' && define.amd ? define(['exports'], factory) :
 (global = typeof globalThis !== 'undefined' ? globalThis : global || self, factory(global.GM = {}));
 })(this, (function (exports) { 'use strict';
 
-var VERSION = exports.VERSION = "0.8.3";
-var GIT_DESCRIBE = exports.GIT_DESCRIBE = "0.8.3-33-g98eb59e-dirty";
+var VERSION = exports.VERSION = "0.8.4";
+var GIT_DESCRIBE = exports.GIT_DESCRIBE = "0.8.4-dirty";
 var GEMMI_GIT_DESCRIBE = exports.GEMMI_GIT_DESCRIBE = "v0.7.5-144-g0445d0c2";
 
 
@@ -8857,6 +8857,7 @@ class Viewer {
   
   
   
+  
 
   constructor(options = {}) {
     options = normalize_viewer_options(options);
@@ -8954,6 +8955,7 @@ class Viewer {
     if (this.help_el) {
       this.help_el.addEventListener('click', this.on_help_click.bind(this));
     }
+    this.viewer_overlay_el = null;
     this.structure_name_el = null;
     this.cid_dialog_el = null;
     this.cid_input_el = null;
@@ -9070,21 +9072,50 @@ class Viewer {
     el.style.fontSize = '18px';
     el.style.color = '#ddd';
     el.style.backgroundColor = 'rgba(0,0,0,0.6)';
-    el.style.textAlign = 'right';
-    el.style.alignSelf = 'stretch';
+    el.style.textAlign = 'left';
+    el.style.alignSelf = 'flex-start';
+    el.style.maxWidth = '75%';
     el.style.padding = '3px 8px';
     el.style.borderRadius = '5px';
     el.style.letterSpacing = '0.08em';
     el.style.fontWeight = 'bold';
+    el.style.whiteSpace = 'nowrap';
+    el.style.overflow = 'hidden';
+    el.style.textOverflow = 'ellipsis';
     el.style.pointerEvents = 'auto'; // ensure selectability
     el.style.cursor = 'text';        // ensure selectability
     el.style.userSelect = 'text';    // ensure selectability
     el.style.webkitUserSelect = 'text'; // ensure selectability
     el.onmousedown = (evt) => evt.stopPropagation();
-    const overlay = document.getElementById('gm-overlay');
+    const overlay = this.get_or_create_viewer_overlay();
     if (overlay) overlay.insertBefore(el, overlay.firstChild);
     else this.container.appendChild(el);
     this.structure_name_el = el;
+  }
+
+  get_or_create_viewer_overlay() {
+    if (this.container == null || typeof document === 'undefined') return null;
+    if (this.viewer_overlay_el && this.viewer_overlay_el.parentElement === this.container) {
+      return this.viewer_overlay_el;
+    }
+    let overlay = this.container.querySelector('.gm-viewer-overlay') ;
+    if (overlay == null) {
+      overlay = document.createElement('div');
+      overlay.className = 'gm-viewer-overlay';
+      overlay.style.position = 'absolute';
+      overlay.style.top = '5px';
+      overlay.style.left = '5px';
+      overlay.style.right = '5px';
+      overlay.style.display = 'flex';
+      overlay.style.flexDirection = 'column';
+      overlay.style.alignItems = 'flex-start';
+      overlay.style.gap = '4px';
+      overlay.style.pointerEvents = 'none';
+      overlay.style.zIndex = '9';
+      this.container.appendChild(overlay);
+    }
+    this.viewer_overlay_el = overlay;
+    return overlay;
   }
 
   create_help_toggle_link() {
@@ -9108,8 +9139,8 @@ class Viewer {
       evt.stopPropagation();
       this.toggle_help();
     };
-    const overlay = _optionalChain([this, 'access', _ => _.hud_el, 'optionalAccess', _2 => _2.parentElement]) || document.getElementById('gm-overlay');
-    if (overlay) overlay.insertBefore(el, this.hud_el || overlay.firstChild);
+    const overlay = this.get_or_create_viewer_overlay();
+    if (overlay) overlay.appendChild(el);
     else this.container.appendChild(el);
   }
 
@@ -10181,7 +10212,7 @@ class Viewer {
 
   create_metals_menu() {
     if (typeof document === 'undefined' || this.container == null) return;
-    const overlay = _optionalChain([this, 'access', _3 => _3.hud_el, 'optionalAccess', _4 => _4.parentElement]);
+    const overlay = _optionalChain([this, 'access', _ => _.hud_el, 'optionalAccess', _2 => _2.parentElement]);
     if (overlay == null) return;
     const row1 = document.createElement('div');
     row1.style.display = 'flex';
@@ -10805,7 +10836,7 @@ class Viewer {
         this.mutate_select_target = target;
         this.sync_mutate_menu_ui();
         this.request_mutation_preview(target);
-        _optionalChain([this, 'access', _5 => _5.mutate_button_el, 'optionalAccess', _6 => _6.focus, 'call', _7 => _7()]);
+        _optionalChain([this, 'access', _3 => _3.mutate_button_el, 'optionalAccess', _4 => _4.focus, 'call', _5 => _5()]);
       });
       list.appendChild(item);
     }
