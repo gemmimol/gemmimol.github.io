@@ -1,5 +1,5 @@
 /*!
- * GemmiMol v0.8.4. Macromolecular Viewer for Crystallographers.
+ * GemmiMol v0.8.5. Macromolecular Viewer for Crystallographers.
  * Copyright 2014 Nat Echols
  * Copyright 2016 Diamond Light Source Ltd
  * Copyright 2016 Marcin Wojdyr
@@ -11,9 +11,9 @@ typeof define === 'function' && define.amd ? define(['exports'], factory) :
 (global = typeof globalThis !== 'undefined' ? globalThis : global || self, factory(global.GM = {}));
 })(this, (function (exports) { 'use strict';
 
-var VERSION = exports.VERSION = "0.8.4";
-var GIT_DESCRIBE = exports.GIT_DESCRIBE = "0.8.4-dirty";
-var GEMMI_GIT_DESCRIBE = exports.GEMMI_GIT_DESCRIBE = "v0.7.5-144-g0445d0c2";
+var VERSION = exports.VERSION = "0.8.5";
+var GIT_DESCRIBE = exports.GIT_DESCRIBE = "0.8.5-1-g57286b9-dirty";
+var GEMMI_GIT_DESCRIBE = exports.GEMMI_GIT_DESCRIBE = "v0.7.5-145-g097e7656";
 
 
 const BondType = {
@@ -4845,7 +4845,6 @@ function WebGLRenderer$1( parameters ) {
     state.viewport( _currentViewport );
   };
 }
-
 // scenes/Fog.js
 let Fog$1 = class Fog {
   constructor(color, near = 1, far = 1000) {
@@ -6173,6 +6172,21 @@ function makeWheels(atom_arr, color_arr, size) {
   return obj;
 }
 
+// Van der Waals radii (in Angstroms) for space-filling rendering.
+const VDW_RADII = {
+  H: 1.20, D: 1.20, HE: 1.40,
+  C: 1.70, N: 1.55, O: 1.52, F: 1.47, NE: 1.54,
+  SI: 2.10, P: 1.80, S: 1.80, CL: 1.75, AR: 1.88,
+  SE: 1.90, BR: 1.85, KR: 2.02, I: 1.98, XE: 2.16,
+  NA: 2.27, MG: 1.73, K: 2.75, CA: 2.31, FE: 1.63,
+  ZN: 1.39, CU: 1.40, MN: 1.39, CO: 1.26, NI: 1.24,
+};
+const VDW_DEFAULT = 1.50;
+
+function getVdwRadius(element) {
+  return _nullishCoalesce$1(VDW_RADII[element.toUpperCase()], () => ( VDW_DEFAULT));
+}
+
 // For the ball-and-stick rendering we use so-called imposters.
 // This technique was described in:
 // http://doi.ieeecomputersociety.org/10.1109/TVCG.2006.115
@@ -6196,6 +6210,50 @@ void main() {
   vpos = mvPosition.xyz;
   mvPosition.xy += corner * radius;
   gl_Position = projectionMatrix * mvPosition;
+}
+`;
+
+// Variant with per-vertex radius for space-filling rendering
+const sphere_var_vert = `
+attribute vec3 color;
+attribute vec2 corner;
+attribute float aRadius;
+varying vec3 vcolor;
+varying vec2 vcorner;
+varying vec3 vpos;
+varying float vRadius;
+
+void main() {
+  vcolor = color;
+  vcorner = corner;
+  vRadius = aRadius;
+  vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+  vpos = mvPosition.xyz;
+  mvPosition.xy += corner * aRadius;
+  gl_Position = projectionMatrix * mvPosition;
+}
+`;
+
+const sphere_var_frag = `
+${fog_pars_fragment}
+uniform mat4 projectionMatrix;
+uniform vec3 lightDir;
+varying vec3 vcolor;
+varying vec2 vcorner;
+varying vec3 vpos;
+varying float vRadius;
+
+void main() {
+  float sq = dot(vcorner, vcorner);
+  if (sq > 1.0) discard;
+  float z = sqrt(1.0-sq);
+  vec3 xyz = vec3(vcorner.x, vcorner.y, z);
+  vec4 projPos = projectionMatrix * vec4(vpos + vRadius * xyz, 1.0);
+  gl_FragDepthEXT = 0.5 * ((gl_DepthRange.diff * (projPos.z / projPos.w)) +
+                           gl_DepthRange.near + gl_DepthRange.far);
+  float weight = clamp(dot(xyz, lightDir), 0.0, 1.0) * 0.8 + 0.2;
+  gl_FragColor = vec4(weight * vcolor, 1.0);
+  ${fog_end_fragment}
 }
 `;
 
@@ -6268,7 +6326,7 @@ void main() {
   float specular = shineStrength * pow(clamp(diffuse, 0.0, 1.0), shinePower) * central;
   vec3 shaded = min(weight, 1.0) * vcolor;
   gl_FragColor = vec4(min(shaded + specular * shineColor, 1.0), 1.0);
-${fog_end_fragment}
+  ${fog_end_fragment}
 }`;
 
 
@@ -6381,6 +6439,64 @@ function makeBalls(atom_arr, color_arr, radius) {
   material.extensions.fragDepth = true;
   const obj = new Mesh(geometry, material);
   return obj;
+}
+
+function makeSpaceFilling(atom_arr, color_arr, scale) {
+  const N = atom_arr.length;
+  const geometry = new BufferGeometry();
+
+  const pos = new Float32Array(N * 4 * 3);
+  const radii = new Float32Array(N * 4);
+  for (let i = 0; i < N; i++) {
+    const xyz = atom_arr[i].xyz;
+    const r = getVdwRadius(atom_arr[i].element) * scale;
+    for (let j = 0; j < 4; j++) {
+      for (let k = 0; k < 3; k++) {
+        pos[3 * (4*i + j) + k] = xyz[k];
+      }
+      radii[4*i + j] = r;
+    }
+  }
+  geometry.setAttribute('position', new BufferAttribute(pos, 3));
+  geometry.setAttribute('aRadius', new BufferAttribute(radii, 1));
+
+  const corner = new Float32Array(N * 4 * 2);
+  for (let i = 0; i < N; i++) {
+    corner[8*i + 0] = -1;
+    corner[8*i + 1] = -1;
+    corner[8*i + 2] = -1;
+    corner[8*i + 3] = 1;
+    corner[8*i + 4] = 1;
+    corner[8*i + 5] = 1;
+    corner[8*i + 6] = 1;
+    corner[8*i + 7] = -1;
+  }
+  geometry.setAttribute('corner', new BufferAttribute(corner, 2));
+
+  const colors = new Float32Array(N * 4 * 3);
+  for (let i = 0; i < N; i++) {
+    const col = color_arr[i];
+    for (let j = 0; j < 4; j++) {
+      colors[3 * (4*i + j) + 0] = col.r;
+      colors[3 * (4*i + j) + 1] = col.g;
+      colors[3 * (4*i + j) + 2] = col.b;
+    }
+  }
+  geometry.setAttribute('color', new BufferAttribute(colors, 3));
+
+  geometry.setIndex(make_quad_index_buffer(N));
+
+  const material = new ShaderMaterial({
+    uniforms: makeUniforms({
+      lightDir: light_dir,
+    }),
+    vertexShader: sphere_var_vert,
+    fragmentShader: sphere_var_frag,
+    fog: true,
+    type: 'um_sphere_var',
+  });
+  material.extensions.fragDepth = true;
+  return new Mesh(geometry, material);
 }
 
 const label_vert = `
@@ -7821,7 +7937,7 @@ function plan_protein_mutation(residue_atoms, target) {
   };
 }
 
-function plan_nucleotide_mutation(residue_atoms, source_kind,
+function plan_nucleotide_mutation(residue_atoms,
                                   target_label) {
   const target = nucleotide_target_resname(residue_atoms[0].resname, target_label);
   const template_atoms = heavy_nucleotide_template_atoms(target);
@@ -7956,12 +8072,13 @@ function plan_residue_mutation(residue_atoms, target_resname) {
     if (target_resname === SUGAR_TO_DNA || target_resname === SUGAR_TO_RNA) {
       return plan_sugar_switch(residue_atoms, kind);
     }
-    return plan_nucleotide_mutation(residue_atoms, kind, target_resname);
+    return plan_nucleotide_mutation(residue_atoms, target_resname);
   }
   throw Error('Mutation is supported only for standard amino-acid and nucleic-acid residues.');
 }
 
 function _nullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return rhsFn(); } } function _optionalChain(ops) { let lastAccessLHS = undefined; let value = ops[0]; let i = 1; while (i < ops.length) { const op = ops[i]; const fn = ops[i + 1]; i += 2; if ((op === 'optionalAccess' || op === 'optionalCall') && value == null) { return undefined; } if (op === 'access' || op === 'optionalAccess') { lastAccessLHS = value; value = fn(value); } else if (op === 'call' || op === 'optionalCall') { value = fn((...args) => value.call(lastAccessLHS, ...args)); lastAccessLHS = undefined; } } return value; }
+
 
 
 
@@ -8133,7 +8250,7 @@ const INIT_HUD_TEXT = 'This is GemmiMol not Coot.';
 const COLOR_PROPS = ['element', 'B-factor', 'pLDDT', 'occupancy',
                      'index', 'chain', 'secondary structure'];
 const MAINCHAIN_STYLES = ['sticks', 'lines', 'backbone', 'cartoon',
-                          'ribbon', 'ball&stick'];
+                          'ribbon', 'ball&stick', 'space-filling'];
 const SIDECHAIN_STYLES = ['sticks', 'lines', 'ball&stick', 'invisible'];
 const LIGAND_STYLES = ['ball&stick', 'sticks', 'lines'];
 const WATER_STYLES = ['sphere', 'cross', 'invisible'];
@@ -8858,6 +8975,7 @@ class Viewer {
   
   
   
+  
 
   constructor(options = {}) {
     options = normalize_viewer_options(options);
@@ -8900,6 +9018,7 @@ class Viewer {
       hydrogens: false,
       ball_size: 0.4,
       stick_radius: 0.08,
+      sphere_scale: 100,
     };
 
     // options of the constructor overwrite default values of the config
@@ -8979,6 +9098,7 @@ class Viewer {
     this.queued_mutation_preview = null;
     this.histogram_el = null;
     this.histogram_redraw = null;
+    this.sphere_scale_el = null;
     this.blob_hits = [];
     this.blob_map_bag = null;
     this.blob_negate = false;
@@ -9020,6 +9140,7 @@ class Viewer {
       el.tabIndex = 0;
     }
     this.create_metals_menu();
+    this.update_viewer_overlay_position();
     this.create_cid_dialog();
     this.decor.zoom_grid.visible = false;
     this.scene.add(this.decor.zoom_grid);
@@ -9072,8 +9193,8 @@ class Viewer {
     el.style.fontSize = '18px';
     el.style.color = '#ddd';
     el.style.backgroundColor = 'rgba(0,0,0,0.6)';
-    el.style.textAlign = 'left';
-    el.style.alignSelf = 'flex-start';
+    el.style.textAlign = 'right';
+    el.style.alignSelf = 'flex-end';
     el.style.maxWidth = '75%';
     el.style.padding = '3px 8px';
     el.style.borderRadius = '5px';
@@ -9096,6 +9217,7 @@ class Viewer {
   get_or_create_viewer_overlay() {
     if (this.container == null || typeof document === 'undefined') return null;
     if (this.viewer_overlay_el && this.viewer_overlay_el.parentElement === this.container) {
+      this.update_viewer_overlay_position();
       return this.viewer_overlay_el;
     }
     let overlay = this.container.querySelector('.gm-viewer-overlay') ;
@@ -9115,7 +9237,22 @@ class Viewer {
       this.container.appendChild(overlay);
     }
     this.viewer_overlay_el = overlay;
+    this.update_viewer_overlay_position();
     return overlay;
+  }
+
+  update_viewer_overlay_position() {
+    const overlay = this.viewer_overlay_el;
+    if (overlay == null || this.container == null || typeof document === 'undefined') return;
+    const global_overlay = document.getElementById('gm-overlay');
+    if (global_overlay == null || this.container.contains(global_overlay)) {
+      overlay.style.top = '5px';
+      return;
+    }
+    const global_rect = global_overlay.getBoundingClientRect();
+    const container_rect = this.container.getBoundingClientRect();
+    const top = Math.max(5, Math.ceil(global_rect.bottom - container_rect.top + 4));
+    overlay.style.top = top + 'px';
   }
 
   create_help_toggle_link() {
@@ -9240,6 +9377,7 @@ class Viewer {
       const err = (type === 'ERR');
       el.style.backgroundColor = (err ? '#b00' : '');
       if (err && text) console.log('ERR: ' + text);
+      this.update_viewer_overlay_position();
     } else {
       console.log('hud:', text);
     }
@@ -9359,33 +9497,6 @@ class Viewer {
     return this.renderer && this.renderer.extensions.get('EXT_frag_depth');
   }
 
-  make_objects_translucent(objects) {
-    for (const obj of objects) {
-      const o = obj ;
-      if (o.material) {
-        this.set_material_opacity(o.material, 0.5);
-      }
-      if (o.children) {
-        for (const child of o.children) {
-          if (child.material) {
-            this.set_material_opacity(child.material, 0.5);
-          }
-        }
-      }
-    }
-  }
-
-  set_material_opacity(material, opacity) {
-    material.transparent = true;
-    if (material.fragmentShader) {
-      material.fragmentShader = material.fragmentShader.replace(
-        /gl_FragColor\s*=\s*vec4\(([^,]+),\s*1\.0\)/g,
-        'gl_FragColor = vec4($1, ' + opacity.toFixed(1) + ')'
-      );
-      material.needsUpdate = true;
-    }
-  }
-
   add_rendered_atoms(target, seen, atoms) {
     for (const atom of atoms) {
       if (!seen.has(atom.i_seq)) {
@@ -9424,72 +9535,88 @@ class Viewer {
       ligand_balls = this.config.ball_size;
     }
     const mainchain_style = model_bag.conf.mainchain_style;
-    const sidechain_style = model_bag.conf.sidechain_style;
-    const wheel_caps = (mainchain_style === 'lines' &&
-                        sidechain_style === 'lines' &&
-                        model_bag.conf.ligand_style === 'lines');
-    const mainchain_filter = (atom) => atom.is_backbone();
-    const sidechain_filter = (atom) => !atom.is_backbone();
-    switch (mainchain_style) {
-      case 'lines':
-        model_bag.add_bonds(true, false, undefined, mainchain_filter, partner_visible, wheel_caps);
-        finish_pass();
-        break;
-      case 'sticks':
-        if (!this.has_frag_depth()) {
-          this.hud('Stick rendering is not working in this browser' +
-                   '\ndue to lack of suppport for EXT_frag_depth', 'ERR');
-          return;
-        }
-        model_bag.add_sticks(true, false, this.config.stick_radius,
-                             mainchain_filter, partner_visible);
-        finish_pass();
-        break;
-      case 'ball&stick':
-        if (!this.has_frag_depth()) {
-          this.hud('Ball-and-stick rendering is not working in this browser' +
-                   '\ndue to lack of suppport for EXT_frag_depth', 'ERR');
-          return;
-        }
-        model_bag.add_bonds(true, false, this.config.ball_size,
-                            mainchain_filter, partner_visible);
-        finish_pass();
-        break;
-      case 'backbone':
-        model_bag.add_trace();
-        finish_pass();
-        break;
-      case 'ribbon':
-        model_bag.add_ribbon(8);
-        finish_pass();
-        break;
-      case 'cartoon':
-        model_bag.add_cartoon(8);
-        finish_pass();
-        break;
-    }
-    switch (sidechain_style) {
-      case 'lines':
-        model_bag.add_bonds(true, false, undefined, sidechain_filter, partner_visible, wheel_caps);
-        finish_pass();
-        break;
-      case 'sticks':
-        model_bag.add_sticks(true, false, this.config.stick_radius,
-                             sidechain_filter, partner_visible);
-        finish_pass();
-        break;
-      case 'ball&stick':
-        model_bag.add_bonds(true, false, this.has_frag_depth() ? this.config.ball_size : undefined,
-                            sidechain_filter, partner_visible);
-        finish_pass();
-        break;
-    }
-    if (ligand_sticks) {
-      model_bag.add_sticks(false, true, this.config.stick_radius);
-      finish_pass();
+
+    // Space-filling is a global style — all atoms as VdW spheres
+    if (mainchain_style.startsWith('space-filling')) {
+      if (!this.has_frag_depth()) {
+        this.hud('Space-filling rendering is not working in this browser' +
+                 '\ndue to lack of support for EXT_frag_depth', 'ERR');
+        return;
+      }
+      const visible_atoms = model_bag.get_visible_atoms();
+      const colors = model_bag.atom_colors(visible_atoms);
+      model_bag.objects.push(makeSpaceFilling(visible_atoms, colors,
+                                               this.config.sphere_scale / 100));
+      model_bag.atom_array = visible_atoms;
+      this.add_rendered_atoms(rendered_atoms, seen_atoms, visible_atoms);
     } else {
-      model_bag.add_bonds(false, true, ligand_balls, undefined, undefined, wheel_caps);
-      finish_pass();
+      const sidechain_style = model_bag.conf.sidechain_style;
+      const wheel_caps = (mainchain_style === 'lines' &&
+                          sidechain_style === 'lines' &&
+                          model_bag.conf.ligand_style === 'lines');
+      const mainchain_filter = (atom) => atom.is_backbone();
+      const sidechain_filter = (atom) => !atom.is_backbone();
+      switch (mainchain_style) {
+        case 'lines':
+          model_bag.add_bonds(true, false, undefined, mainchain_filter, partner_visible, wheel_caps);
+          finish_pass();
+          break;
+        case 'sticks':
+          if (!this.has_frag_depth()) {
+            this.hud('Stick rendering is not working in this browser' +
+                     '\ndue to lack of suppport for EXT_frag_depth', 'ERR');
+            return;
+          }
+          model_bag.add_sticks(true, false, this.config.stick_radius,
+                               mainchain_filter, partner_visible);
+          finish_pass();
+          break;
+        case 'ball&stick':
+          if (!this.has_frag_depth()) {
+            this.hud('Ball-and-stick rendering is not working in this browser' +
+                     '\ndue to lack of suppport for EXT_frag_depth', 'ERR');
+            return;
+          }
+          model_bag.add_bonds(true, false, this.config.ball_size,
+                              mainchain_filter, partner_visible);
+          finish_pass();
+          break;
+        case 'backbone':
+          model_bag.add_trace();
+          finish_pass();
+          break;
+        case 'ribbon':
+          model_bag.add_ribbon(8);
+          finish_pass();
+          break;
+        case 'cartoon':
+          model_bag.add_cartoon(8);
+          finish_pass();
+          break;
+      }
+      switch (sidechain_style) {
+        case 'lines':
+          model_bag.add_bonds(true, false, undefined, sidechain_filter, partner_visible, wheel_caps);
+          finish_pass();
+          break;
+        case 'sticks':
+          model_bag.add_sticks(true, false, this.config.stick_radius,
+                               sidechain_filter, partner_visible);
+          finish_pass();
+          break;
+        case 'ball&stick':
+          model_bag.add_bonds(true, false, this.has_frag_depth() ? this.config.ball_size : undefined,
+                              sidechain_filter, partner_visible);
+          finish_pass();
+          break;
+      }
+      if (ligand_sticks) {
+        model_bag.add_sticks(false, true, this.config.stick_radius);
+        finish_pass();
+      } else {
+        model_bag.add_bonds(false, true, ligand_balls, undefined, undefined, wheel_caps);
+        finish_pass();
+      }
     }
     model_bag.atom_array = rendered_atoms;
     for (const o of model_bag.objects) {
@@ -10248,6 +10375,8 @@ class Viewer {
     row2.appendChild(this.download_select_el);
     overlay.appendChild(row1);
     overlay.appendChild(row2);
+    this.update_viewer_overlay_position();
+    if (this.tied_viewer) this.tied_viewer.update_viewer_overlay_position();
   }
 
   update_nav_menus() {
@@ -10267,6 +10396,8 @@ class Viewer {
     this.update_download_select(this.download_select_el, bag);
     this.update_delete_select(this.delete_select_el);
     this.update_mutate_select(this.mutate_select_el);
+    this.update_viewer_overlay_position();
+    if (this.tied_viewer) this.tied_viewer.update_viewer_overlay_position();
   }
 
   update_blob_select(select) {
@@ -10723,6 +10854,23 @@ class Viewer {
     select.disabled = (edit == null);
     select.style.display = (editable_bag == null) ? 'none' : '';
     select.value = '';
+    const opts = select.options;
+    if (edit != null) {
+      const a = edit.atom;
+      for (let i = 1; i < opts.length; i++) {
+        const v = opts[i].value;
+        if (v === 'atom') opts[i].textContent = 'atom ' + a.name;
+        else if (v === 'residue') opts[i].textContent = 'residue /' + a.seqid + ' ' + a.resname + '/' + a.chain;
+        else if (v === 'chain') opts[i].textContent = 'chain ' + a.chain;
+      }
+    } else {
+      for (let i = 1; i < opts.length; i++) {
+        const v = opts[i].value;
+        if (v === 'atom') opts[i].textContent = 'atom';
+        else if (v === 'residue') opts[i].textContent = 'residue';
+        else if (v === 'chain') opts[i].textContent = 'chain';
+      }
+    }
   }
 
   mutation_target_from_resname(resname) {
@@ -11867,11 +12015,27 @@ class Viewer {
     this.request_render();
   }
 
+  style_menus_html() {
+    return this.select_menu_html('mainchain as', 'mainchain_style', MAINCHAIN_STYLES) + '<br>' +
+           this.select_menu_html('sidechains as', 'sidechain_style', SIDECHAIN_STYLES) + '<br>' +
+           this.select_menu_html('ligands as', 'ligand_style', LIGAND_STYLES) + '<br>' +
+           this.select_menu_html('waters as', 'water_style', WATER_STYLES);
+  }
+
   set_selected_option(info, key, options, value) {
     if (options.indexOf(value) === -1) return;
     this.config[key] = value;
     this.apply_selected_option(key);
-    this.hud(this.select_menu_html(info, key, options), 'HTML');
+    const is_style = key === 'mainchain_style' || key === 'sidechain_style' ||
+                     key === 'ligand_style' || key === 'water_style';
+    if (is_style) {
+      this.hud(this.style_menus_html(), 'HTML');
+    } else {
+      this.hud(this.select_menu_html(info, key, options), 'HTML');
+    }
+    if (key === 'mainchain_style') {
+      this.show_sphere_scale_slider(value.startsWith('space-filling'));
+    }
   }
 
   on_hud_click(event) {
@@ -11888,6 +12052,47 @@ class Viewer {
         return;
       }
       el = el.parentElement;
+    }
+  }
+
+  show_sphere_scale_slider(show) {
+    if (!this.container) return;
+    if (!show) {
+      if (this.sphere_scale_el) this.sphere_scale_el.style.display = 'none';
+      return;
+    }
+    if (!this.sphere_scale_el) {
+      const div = document.createElement('div');
+      div.style.position = 'absolute';
+      div.style.bottom = '5px';
+      div.style.left = '50%';
+      div.style.transform = 'translateX(-50%)';
+      div.style.color = 'white';
+      div.style.fontSize = '14px';
+      div.style.zIndex = '1';
+      div.style.background = 'rgba(0,0,0,0.5)';
+      div.style.padding = '4px 10px';
+      div.style.borderRadius = '4px';
+      div.innerHTML = 'sphere scale: <input type="range" min="0" max="100" value="' +
+                      this.config.sphere_scale + '" style="vertical-align:middle">' +
+                      ' <span>' + this.config.sphere_scale + '%</span>';
+      const self = this;
+      const input = div.querySelector('input') ;
+      const label = div.querySelector('span') ;
+      input.addEventListener('input', function () {
+        self.config.sphere_scale = parseInt(input.value, 10);
+        label.textContent = self.config.sphere_scale + '%';
+        self.redraw_models();
+        self.request_render();
+      });
+      this.container.appendChild(div);
+      this.sphere_scale_el = div;
+    } else {
+      const input = this.sphere_scale_el.querySelector('input') ;
+      const label = this.sphere_scale_el.querySelector('span') ;
+      input.value = String(this.config.sphere_scale);
+      label.textContent = this.config.sphere_scale + '%';
+      this.sphere_scale_el.style.display = '';
     }
   }
 
@@ -12420,7 +12625,7 @@ class Viewer {
       this.update_camera();
     }
     const tied = this.tied_viewer;
-    if (!this.controls.is_going()) {
+    if (!this.controls.is_moving()) {
       this.redraw_maps();
       if (tied && !tied.scheduled) tied.redraw_maps();
     }
@@ -12964,7 +13169,8 @@ class Viewer {
 Viewer.prototype.MOUSE_HELP = [
   '<b>mouse:</b>',
   'Left = rotate',
-  'Middle or Ctrl+Left = pan',
+  'Middle = select and center on atom',
+  'Middle+drag or Ctrl+Left = pan',
   'Right = zoom',
   'Ctrl+Right = clipping',
   'Ctrl+Shift+Right = roll',
@@ -13720,6 +13926,7 @@ exports.makeLineSegments = makeLineSegments;
 exports.makeRgbBox = makeRgbBox;
 exports.makeRibbon = makeRibbon;
 exports.makeSmoothSurface = makeSmoothSurface;
+exports.makeSpaceFilling = makeSpaceFilling;
 exports.makeSticks = makeSticks;
 exports.makeUniforms = makeUniforms;
 exports.makeWheels = makeWheels;

@@ -5,93 +5,17 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, user-scalable=no">
   <meta name="theme-color" content="#333333">
-  <style>
-   body { font-family: sans-serif; }
-   canvas { display: block; }
-   #viewer {
-     position: absolute;
-     left: 0;
-     top: 0;
-     width: 100%;
-     height: 100%;
-   }
-   #gm-overlay {
-     position: absolute;
-     top: 5px;
-     left: 5px;
-     right: 5px;
-     display: flex;
-     flex-direction: column;
-     align-items: flex-start;
-     gap: 4px;
-     pointer-events: none;
-     z-index: 9;
-   }
-   #gm-overlay > * { pointer-events: auto; }
-   #gm-overlay > header {
-     color: #ddd;
-     background-color: rgba(0,0,0,0.6);
-     padding: 3px 8px;
-     border-radius: 5px;
-     cursor: text;
-     -webkit-user-select: text;
-     user-select: text;
-   }
-   #title {
-     font-size: 18px;
-     font-weight: bold;
-     letter-spacing: 0.08em;
-     align-self: flex-end;
-     max-width: 50vw;
-     white-space: nowrap;
-   }
-   #hud {
-     font-size: 15px;
-     text-align: center;
-     align-self: center;
-     width: 80%;
-     white-space: pre-line;
-   }
-   #hud u { padding: 0 8px; text-decoration: none;
-            border: solid; border-width: 1px 0; }
-   #hud s { padding: 0 8px; text-decoration: none; opacity: 0.5; }
-   #help {
-     display: none;
-     font-size: 16px;
-     color: #eee;
-     background-color: rgba(0,0,0,0.7);
-     position: absolute;
-     left: 20px;
-     top: 50%;
-     transform: translateY(-50%);
-     cursor: default;
-     padding: 5px;
-     border-radius: 5px;
-     z-index: 9;
-     white-space: pre-line;
-   }
-   #inset {
-     width: 200px;
-     height: 200px;
-     background-color: #888;
-     position: absolute;
-     right: 0;
-     bottom: 0;
-     z-index: 2;
-     display: none;
-   }
-   a { color: #59C; }
-  </style>
+  <link rel="stylesheet" href="gemmimol.css">
 
-  <script src="gemmimol.js?v=title-select-7"></script>
-  <script src="vendor/wasm/gemmi.js"></script>
+  <script src="gemmimol.js?v=20260410-no-ao-1"></script>
+  <script src="vendor/wasm/gemmi.js?v=20260408-hotfix-1"></script>
 
 </head>
 <body style="background-color: black">
   <div id="viewer"></div>
-  <div id="gm-overlay" onmousedown="event.stopPropagation();">
-    <header id="title"></header>
-    <header id="hud"></header>
+  <div id="gm-overlay">
+    <header id="hud" onmousedown="event.stopPropagation();"
+                     ondblclick="event.stopPropagation();"></header>
   </div>
   <footer id="help"></footer>
   <div id="inset"></div>
