@@ -8263,6 +8263,8 @@ const LABEL_FONTS = ['bold 14px', '14px', '16px', 'bold 16px'];
 
 
 
+
+
 function escape_html(text) {
   return text.replace(/[&<>"']/g, (ch) => ({
     '&': '&amp;',
@@ -8911,6 +8913,8 @@ class Viewer {
   
   
   
+  
+  
 
   
   
@@ -8992,6 +8996,10 @@ class Viewer {
     //this.nav = null;
     this.xhr_headers = {};
     this.monomer_cif_cache = {};
+    this.monomer_fetcher = typeof options.monomer_fetcher === 'function' ?
+      options.monomer_fetcher : null;
+    this.monomer_url_template = typeof options.monomer_url_template === 'string' ?
+      options.monomer_url_template : null;
     this.last_bonding_info = null;
     this.sym_model_bags = [];
     this.sym_bond_objects = [];
@@ -9546,7 +9554,7 @@ class Viewer {
       const visible_atoms = model_bag.get_visible_atoms();
       const colors = model_bag.atom_colors(visible_atoms);
       model_bag.objects.push(makeSpaceFilling(visible_atoms, colors,
-                                               this.config.sphere_scale / 100));
+                                              this.config.sphere_scale / 100));
       model_bag.atom_array = visible_atoms;
       this.add_rendered_atoms(rendered_atoms, seen_atoms, visible_atoms);
     } else {
@@ -12924,18 +12932,24 @@ class Viewer {
   fetch_monomer_cif(resname) {
     const name = resname.toUpperCase();
     if (!(name in this.monomer_cif_cache)) {
-      const template = aminoAcidTemplate(name) || nucleotideTemplate(name);
-      if (template != null) {
-        this.monomer_cif_cache[name] = Promise.resolve(template.cif);
-      } else {
-        this.monomer_cif_cache[name] = fetch(
-          'https://files.rcsb.org/ligands/view/' + encodeURIComponent(name) + '.cif'
-        ).then(function (resp) {
+      const self = this;
+      const default_fetch = function () {
+        const template = aminoAcidTemplate(name) || nucleotideTemplate(name);
+        if (template != null) return Promise.resolve(template.cif);
+        const url = self.monomer_url_template != null ?
+          self.monomer_url_template.replace(/\{name\}/g, encodeURIComponent(name)) :
+          'https://files.rcsb.org/ligands/view/' + encodeURIComponent(name) + '.cif';
+        return fetch(url).then(function (resp) {
           return resp.ok ? resp.text() : null;
         }).catch(function () {
           return null;
         });
-      }
+      };
+      this.monomer_cif_cache[name] = this.monomer_fetcher ?
+        Promise.resolve(this.monomer_fetcher(name)).then(function (text) {
+          return text != null ? text : default_fetch();
+        }) :
+        default_fetch();
     }
     return this.monomer_cif_cache[name];
   }
