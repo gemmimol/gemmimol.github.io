@@ -1,6 +1,7 @@
 ---
 layout: default
 permalink: /integration.html
+title: Integration
 ---
 
 # Integration

@@ -12,7 +12,7 @@ typeof define === 'function' && define.amd ? define(['exports'], factory) :
 })(this, (function (exports) { 'use strict';
 
 var VERSION = exports.VERSION = "0.8.5";
-var GIT_DESCRIBE = exports.GIT_DESCRIBE = "0.8.5-1-g57286b9-dirty";
+var GIT_DESCRIBE = exports.GIT_DESCRIBE = "0.8.5-2-gdc3a670-dirty";
 var GEMMI_GIT_DESCRIBE = exports.GEMMI_GIT_DESCRIBE = "v0.7.5-145-g097e7656";
 
 
@@ -9335,7 +9335,9 @@ class Viewer {
       // search directly atom array ignoring matrixWorld
       const vec = new Vector3();
       // required picking precision: 0.35A at zoom 50, 0.27A @z30, 0.44 @z80
-      const precision2 = 0.35 * 0.35 * 0.02 * camera.zoom;
+      const default_prec2 = 0.35 * 0.35 * 0.02 * camera.zoom;
+      const space_filling = bag.conf.mainchain_style.startsWith('space-filling');
+      const sphere_scale = space_filling ? this.config.sphere_scale / 100 : 0;
       for (const atom of bag.atom_array) {
         vec.set(atom.xyz[0] - ray.origin.x,
                 atom.xyz[1] - ray.origin.y,
@@ -9343,6 +9345,8 @@ class Viewer {
         const distance = vec.dot(ray.direction);
         if (distance < 0 || distance < near || distance > far) continue;
         const diff2 = vec.addScaledVector(ray.direction, -distance).lengthSq();
+        const r = space_filling ? getVdwRadius(atom.element) * sphere_scale : 0;
+        const precision2 = Math.max(default_prec2, r * r);
         if (diff2 > precision2) continue;
         if (pick == null || distance < pick.distance) {
           pick = {bag, atom, distance};
@@ -13927,6 +13931,7 @@ exports.addXyzCross = addXyzCross;
 exports.bondDataFromGemmiStructure = bondDataFromGemmiStructure;
 exports.fog_end_fragment = fog_end_fragment;
 exports.fog_pars_fragment = fog_pars_fragment;
+exports.getVdwRadius = getVdwRadius;
 exports.help_action_link = help_action_link;
 exports.load_maps_from_mtz = load_maps_from_mtz;
 exports.load_maps_from_mtz_buffer = load_maps_from_mtz_buffer;
