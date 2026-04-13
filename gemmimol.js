@@ -1,5 +1,5 @@
 /*!
- * GemmiMol v0.8.5. Macromolecular Viewer for Crystallographers.
+ * GemmiMol v0.8.6. Macromolecular Viewer for Crystallographers.
  * Copyright 2014 Nat Echols
  * Copyright 2016 Diamond Light Source Ltd
  * Copyright 2016 Marcin Wojdyr
@@ -11,8 +11,8 @@ typeof define === 'function' && define.amd ? define(['exports'], factory) :
 (global = typeof globalThis !== 'undefined' ? globalThis : global || self, factory(global.GM = {}));
 })(this, (function (exports) { 'use strict';
 
-var VERSION = exports.VERSION = "0.8.5";
-var GIT_DESCRIBE = exports.GIT_DESCRIBE = "0.8.5-2-gdc3a670-dirty";
+var VERSION = exports.VERSION = "0.8.6";
+var GIT_DESCRIBE = exports.GIT_DESCRIBE = "0.8.5-7-gd0dfc2f";
 var GEMMI_GIT_DESCRIBE = exports.GEMMI_GIT_DESCRIBE = "v0.7.5-145-g097e7656";
 
 
@@ -8254,6 +8254,12 @@ const MAINCHAIN_STYLES = ['sticks', 'lines', 'backbone', 'cartoon',
 const SIDECHAIN_STYLES = ['sticks', 'lines', 'ball&stick', 'invisible'];
 const LIGAND_STYLES = ['ball&stick', 'sticks', 'lines'];
 const WATER_STYLES = ['sphere', 'cross', 'invisible'];
+const STYLE_MENUS = [
+  ['mainchain as', 'mainchain_style', MAINCHAIN_STYLES],
+  ['sidechains as', 'sidechain_style', SIDECHAIN_STYLES],
+  ['ligands as', 'ligand_style', LIGAND_STYLES],
+  ['waters as', 'water_style', WATER_STYLES],
+];
 const MAP_STYLES = ['marching cubes', 'smooth surface'/*, 'snapped MC'*/];
 const LABEL_FONTS = ['bold 14px', '14px', '16px', 'bold 16px'];
 
@@ -8980,6 +8986,7 @@ class Viewer {
   
   
   
+  
 
   constructor(options = {}) {
     options = normalize_viewer_options(options);
@@ -9103,6 +9110,7 @@ class Viewer {
     this.mutate_select_target = null;
     this.mutate_select_residue_key = null;
     this.mutate_select_busy = false;
+    this.viewer_only_mode = false;
     this.queued_mutation_preview = null;
     this.histogram_el = null;
     this.histogram_redraw = null;
@@ -10854,8 +10862,9 @@ class Viewer {
                          bag) {
     if (select == null) return;
     const ctx = this.download_target_context(bag);
+    const hide = this.viewer_only_mode || ctx == null;
     select.disabled = (ctx == null);
-    select.style.display = (ctx == null) ? 'none' : '';
+    select.style.display = hide ? 'none' : '';
     select.value = '';
   }
 
@@ -10864,23 +10873,18 @@ class Viewer {
     const editable_bag = this.editable_model_bag();
     const edit = this.current_edit_target();
     select.disabled = (edit == null);
-    select.style.display = (editable_bag == null) ? 'none' : '';
+    select.style.display =
+      (this.viewer_only_mode || editable_bag == null) ? 'none' : '';
     select.value = '';
-    const opts = select.options;
-    if (edit != null) {
-      const a = edit.atom;
-      for (let i = 1; i < opts.length; i++) {
-        const v = opts[i].value;
-        if (v === 'atom') opts[i].textContent = 'atom ' + a.name;
-        else if (v === 'residue') opts[i].textContent = 'residue /' + a.seqid + ' ' + a.resname + '/' + a.chain;
-        else if (v === 'chain') opts[i].textContent = 'chain ' + a.chain;
-      }
-    } else {
-      for (let i = 1; i < opts.length; i++) {
-        const v = opts[i].value;
-        if (v === 'atom') opts[i].textContent = 'atom';
-        else if (v === 'residue') opts[i].textContent = 'residue';
-        else if (v === 'chain') opts[i].textContent = 'chain';
+    const a = edit ? edit.atom : null;
+    for (const opt of select.options) {
+      if (opt.value === 'atom') {
+        opt.textContent = 'atom' + (a ? ' ' + a.name : '');
+      } else if (opt.value === 'residue') {
+        opt.textContent = 'residue' +
+          (a ? ' /' + a.seqid + ' ' + a.resname + '/' + a.chain : '');
+      } else if (opt.value === 'chain') {
+        opt.textContent = 'chain' + (a ? ' ' + a.chain : '');
       }
     }
   }
@@ -11003,7 +11007,8 @@ class Viewer {
     button.disabled = (edit == null || targets.length === 0);
     button.style.opacity = button.disabled ? '0.7' : '1';
     button.style.cursor = button.disabled ? 'default' : 'pointer';
-    select.style.display = (editable_bag == null) ? 'none' : '';
+    select.style.display =
+      (this.viewer_only_mode || editable_bag == null) ? 'none' : '';
     const current_target = edit == null ? '' : this.mutation_target_from_resname(edit.atom.resname);
     const value = targets.indexOf(preferred_target) !== -1 ? preferred_target :
       (targets.indexOf(current_target) !== -1 ? current_target : '');
@@ -11312,6 +11317,98 @@ class Viewer {
       }
     }
     return best ? best.ctx : null;
+  }
+
+  viewer_only(enabled = true) {
+    this.viewer_only_mode = enabled;
+    this.update_nav_menus();
+  }
+
+  set_model(text, name = 'model.pdb') {
+    for (const uid in this.labels) {
+      this.remove_and_dispose(this.labels[uid].o.mesh);
+      delete this.labels[uid];
+    }
+    for (const bag of this.model_bags) this.clear_model_objects(bag);
+    this.model_bags = [];
+    this.sym_model_bags = [];
+    this.selected = {bag: null, atom: null};
+    this.blob_hits = [];
+    this.blob_map_bag = null;
+    this.mutate_select_target = null;
+    this.mutate_select_residue_key = null;
+    this.queued_mutation_preview = null;
+    this.last_bonding_info = null;
+    return this.load_model_from_text(text, name);
+  }
+
+  apply_state(state) {
+    if (state == null) return;
+    if (state.config) {
+      const keep_scheme = this.config.color_scheme;
+      for (const k of Object.keys(state.config)) {
+        if (k in this.config) (this.config )[k] = state.config[k];
+      }
+      if (this.config.color_scheme !== keep_scheme) {
+        this.set_colors();
+      } else {
+        this.redraw_models();
+      }
+    }
+    if (state.view) {
+      const v = state.view;
+      if (v.target) this.target.set(v.target[0], v.target[1], v.target[2]);
+      if (v.camera_position) {
+        this.camera.position.set(v.camera_position[0],
+                                 v.camera_position[1],
+                                 v.camera_position[2]);
+      }
+      if (v.up) this.camera.up.set(v.up[0], v.up[1], v.up[2]);
+      if (typeof v.zoom === 'number') this.camera.zoom = v.zoom;
+      this.camera.lookAt(this.target);
+      this.camera.updateProjectionMatrix();
+    }
+    this.request_render();
+  }
+
+  get_current_state() {
+    const c = this.config;
+    return {
+      config: {
+        bond_line: c.bond_line,
+        map_line: c.map_line,
+        map_radius: c.map_radius,
+        default_isolevel: c.default_isolevel,
+        map_style: c.map_style,
+        mainchain_style: c.mainchain_style,
+        sidechain_style: c.sidechain_style,
+        ligand_style: c.ligand_style,
+        water_style: c.water_style,
+        color_prop: c.color_prop,
+        label_font: c.label_font,
+        color_scheme: c.color_scheme,
+        hydrogens: c.hydrogens,
+        ball_size: c.ball_size,
+        stick_radius: c.stick_radius,
+        sphere_scale: c.sphere_scale,
+      },
+      view: {
+        target: [this.target.x, this.target.y, this.target.z],
+        camera_position: [this.camera.position.x,
+                          this.camera.position.y,
+                          this.camera.position.z],
+        up: [this.camera.up.x, this.camera.up.y, this.camera.up.z],
+        zoom: this.camera.zoom,
+      },
+    };
+  }
+
+  get_current_structure(format = 'mmcif') {
+    const ctx = this.download_target_context();
+    if (ctx == null) return null;
+    return format === 'pdb' ?
+      ctx.gemmi.make_pdb_string(ctx.structure) :
+      ctx.gemmi.make_mmcif_string(ctx.structure);
   }
 
   download_model(format) {
@@ -12028,18 +12125,15 @@ class Viewer {
   }
 
   style_menus_html() {
-    return this.select_menu_html('mainchain as', 'mainchain_style', MAINCHAIN_STYLES) + '<br>' +
-           this.select_menu_html('sidechains as', 'sidechain_style', SIDECHAIN_STYLES) + '<br>' +
-           this.select_menu_html('ligands as', 'ligand_style', LIGAND_STYLES) + '<br>' +
-           this.select_menu_html('waters as', 'water_style', WATER_STYLES);
+    return STYLE_MENUS.map(([info, k, opts]) =>
+      this.select_menu_html(info, k, opts)).join('<br>');
   }
 
   set_selected_option(info, key, options, value) {
     if (options.indexOf(value) === -1) return;
     this.config[key] = value;
     this.apply_selected_option(key);
-    const is_style = key === 'mainchain_style' || key === 'sidechain_style' ||
-                     key === 'ligand_style' || key === 'water_style';
+    const is_style = STYLE_MENUS.some(([, k]) => k === key);
     if (is_style) {
       this.hud(this.style_menus_html(), 'HTML');
     } else {
@@ -12994,8 +13088,8 @@ class Viewer {
     });
   }
 
-  // Load molecular model from PDB file and centers the view
-  load_pdb_from_text(text, name='model.pdb', explicit_gemmi) {
+  // Load molecular model from PDB or mmCIF text and centers the view
+  load_model_from_text(text, name='model.pdb', explicit_gemmi) {
     const self = this;
     return this.resolve_gemmi(explicit_gemmi).then(function (gemmi) {
       if (!gemmi) throw Error('Gemmi is required for coordinate loading.');
@@ -13025,10 +13119,10 @@ class Viewer {
     });
   }
 
-  load_pdb(url, options,
+  load_model(url, options,
            callback) {
     if (Array.isArray(url)) {
-      this.load_pdb_candidates(url, options, callback);
+      this.load_model_candidates(url, options, callback);
       return;
     }
     const self = this;
@@ -13046,7 +13140,7 @@ class Viewer {
     });
   }
 
-   load_pdb_candidates(urls, options,
+   load_model_candidates(urls, options,
                               callback) {
     const self = this;
     const gemmi = options && options.gemmi;
@@ -13127,10 +13221,10 @@ class Viewer {
   }
 
   // Load a model (PDB), normal map and a difference map - in this order.
-  load_pdb_and_maps(pdb, map1, map2,
+  load_model_and_maps(pdb, map1, map2,
                     options, callback) {
     const self = this;
-    this.load_pdb(pdb, options, function () {
+    this.load_model(pdb, options, function () {
       self.load_maps(map1, map2, options, callback);
     });
   }
@@ -13139,15 +13233,15 @@ class Viewer {
   load_ccp4_maps(url1, url2, callback) {
     this.load_maps(url1, url2, {format: 'ccp4'}, callback);
   }
-  load_pdb_and_ccp4_maps(pdb, map1, map2,
+  load_model_and_ccp4_maps(pdb, map1, map2,
                          callback) {
-    this.load_pdb_and_maps(pdb, map1, map2, {format: 'ccp4'}, callback);
+    this.load_model_and_maps(pdb, map1, map2, {format: 'ccp4'}, callback);
   }
 
   // pdb_id here should be lowercase ('1abc')
   load_from_pdbe(pdb_id, callback) {
     const id = pdb_id.toLowerCase();
-    this.load_pdb_and_maps(
+    this.load_model_and_maps(
       [
         'https://www.ebi.ac.uk/pdbe/entry-files/pdb' + id + '.ent',
         'https://www.ebi.ac.uk/pdbe/entry-files/download/' + id + '_updated.cif',
@@ -13158,7 +13252,7 @@ class Viewer {
   }
   load_from_rcsb(pdb_id, callback) {
     const id = pdb_id.toLowerCase();
-    this.load_pdb_and_maps(
+    this.load_model_and_maps(
       'https://files.rcsb.org/download/' + id + '.pdb',
       'https://edmaps.rcsb.org/maps/' + id + '_2fofc.dsn6',
       'https://edmaps.rcsb.org/maps/' + id + '_fofc.dsn6',
