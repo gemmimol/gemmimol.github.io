@@ -33,6 +33,7 @@ Try it:
 It also has a [reciprocal space spin-off](reciprocal.html?rlp=data/rlp.csv).
 
 GemmiMol is a small (~3 KLOC) [project](https://github.com/gemmimol/gemmimol)
+(see [changelog](https://github.com/gemmimol/gemmimol/releases/)).
 The plan is to keep it small. But if you're missing some functionality,
 it won't hurt if you get in touch --
 use [Issues](https://github.com/gemmimol/gemmimol/issues)

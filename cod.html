@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <title>COD example - GemmiMol</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, user-scalable=no">
+  <meta name="theme-color" content="#333333">
+  <link rel="stylesheet" href="gemmimol.css">
+
+  <script src="gemmimol.js?v=symm-colors-1"></script>
+  <script src="vendor/wasm/gemmi.js"></script>
+
+</head>
+<body style="background-color: black">
+  <div id="viewer"></div>
+  <div id="gm-overlay">
+    <header id="hud" onmousedown="event.stopPropagation();"
+                     ondblclick="event.stopPropagation();"></header>
+  </div>
+  <footer id="help"></footer>
+  <div id="inset"></div>
+  <script>
+    // Minimal demo: fetch a small-molecule CIF from the
+    // Crystallography Open Database (http://www.crystallography.net/cod/),
+    // parse it with gemmi.read_small_structure, convert to PDB text,
+    // and load into the viewer.
+    //
+    // COD 1508895 is an iron porphyrin from a 2013 heme distortion study.
+    // The CIF is served from data/ because crystallography.net does not
+    // send CORS headers.
+    V = new GM.Viewer({viewer: "viewer", hud: "hud", help: "help"});
+    V.hud("loading COD 1508895...");
+
+    function padLeft(s, n) {
+      s = String(s);
+      while (s.length < n) s = ' ' + s;
+      return s;
+    }
+    function padRight(s, n) {
+      s = String(s);
+      while (s.length < n) s = s + ' ';
+      return s;
+    }
+    function pdbFloat(x, width, decimals) {
+      return padLeft(x.toFixed(decimals), width);
+    }
+
+    function smallStructureToPdb(ss) {
+      const cell = ss.cell;
+      const lines = [];
+      const sg = ss.spacegroup_hm || 'P 1';
+      lines.push('CRYST1' +
+        pdbFloat(cell.a, 9, 3) + pdbFloat(cell.b, 9, 3) + pdbFloat(cell.c, 9, 3) +
+        pdbFloat(cell.alpha, 7, 2) + pdbFloat(cell.beta, 7, 2) +
+        pdbFloat(cell.gamma, 7, 2) +
+        ' ' + padRight(sg, 11).slice(0, 11) + '   1');
+      const sites = ss.sites;
+      const n = sites.size();
+      for (let i = 0; i < n; i++) {
+        const site = sites.get(i);
+        const pos = site.orth(cell);
+        const el = (site.element_uname || 'C').toUpperCase();
+        const label = site.label.toUpperCase().replace(/[^A-Z0-9]/g, '');
+        let nameField;
+        if (el.length === 1) {
+          nameField = ' ' + padRight(label.slice(0, 3), 3);
+        } else {
+          nameField = padRight(label.slice(0, 4), 4);
+        }
+        lines.push(
+          'HETATM' + padLeft((i + 1) % 100000, 5) + ' ' + nameField +
+          ' LIG A   1    ' +
+          pdbFloat(pos[0], 8, 3) + pdbFloat(pos[1], 8, 3) + pdbFloat(pos[2], 8, 3) +
+          '  1.00  0.00          ' + padLeft(el, 2));
+        site.delete && site.delete();
+      }
+      lines.push('END');
+      return lines.join('\n');
+    }
+
+    Gemmi().then(function (gemmi) {
+      V.load_file('data/cod_1508895.cif', {progress: true}, function (req) {
+        try {
+          const ss = gemmi.read_small_structure(req.responseText, 'cod_1508895.cif');
+          const pdbText = smallStructureToPdb(ss);
+          ss.delete();
+          V.load_model_from_text(pdbText, 'cod_1508895.pdb', gemmi).then(function () {
+            V.hud('COD 1508895: iron porphyrin (heme analogue)');
+          });
+        } catch (e) {
+          V.hud('Error: ' + e.message, 'ERR');
+        }
+      });
+    });
+  </script>
+</body>
+</html>
