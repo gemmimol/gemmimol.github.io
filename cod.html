@@ -25,11 +25,11 @@
     // parse it with gemmi.read_small_structure, convert to PDB text,
     // and load into the viewer.
     //
-    // COD 1508895 is an iron porphyrin from a 2013 heme distortion study.
+    // COD 1542540 is Cs[NMe4][B12H12].H2O (Tiritiris & Schleid, 2016).
     // The CIF is served from data/ because crystallography.net does not
     // send CORS headers.
     V = new GM.Viewer({viewer: "viewer", hud: "hud", help: "help"});
-    V.hud("loading COD 1508895...");
+    V.hud("loading COD 1542540...");
 
     function padLeft(s, n) {
       s = String(s);
@@ -79,13 +79,14 @@
     }
 
     Gemmi().then(function (gemmi) {
-      V.load_file('data/cod_1508895.cif', {progress: true}, function (req) {
+      V.load_file('data/cod_1542540.cif', {progress: true}, function (req) {
         try {
-          const ss = gemmi.read_small_structure(req.responseText, 'cod_1508895.cif');
+          const ss = gemmi.read_small_structure(req.responseText, 'cod_1542540.cif');
           const pdbText = smallStructureToPdb(ss);
           ss.delete();
-          V.load_model_from_text(pdbText, 'cod_1508895.pdb', gemmi).then(function () {
-            V.hud('COD 1508895: iron porphyrin (heme analogue)');
+          V.load_model_from_text(pdbText, 'cod_1542540.pdb', gemmi).then(function () {
+            V.load_ccp4_maps('data/cod_1542540.map', 'data/cod_1542540_diff.map');
+            V.hud('COD 1542540: Cs[NMe4][B12H12].H2O');
           });
         } catch (e) {
           V.hud('Error: ' + e.message, 'ERR');

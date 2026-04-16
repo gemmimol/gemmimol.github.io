@@ -29,6 +29,8 @@ Try it:
   (Dimple result, thaumatin, 1.4Å),
 - or any [local file or wwPDB entry](view/).
 
+Small molecule from [COD](http://www.crystallography.net/cod/):
+[Cs[NMe4][B12H12].H2O](cod.html) (COD 1542540).
 
 It also has a [reciprocal space spin-off](reciprocal.html?rlp=data/rlp.csv).
 
