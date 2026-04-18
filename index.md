@@ -30,7 +30,7 @@ Try it:
 - or any [local file or wwPDB entry](view/).
 
 Small molecule from [COD](http://www.crystallography.net/cod/):
-[Cs[NMe4][B12H12].H2O](cod.html) (COD 1542540).
+[caffeine](cod.html) ([COD 1542540](https://www.crystallography.net/cod/1542540.html)).
 
 It also has a [reciprocal space spin-off](reciprocal.html?rlp=data/rlp.csv).
 
@@ -44,6 +44,6 @@ or [email](mailto:wojdyr@gmail.com).
 See the [UglyMol Wiki](https://github.com/uglymol/uglymol/wiki)
 for more information.
 
-current version:<br>GemmiMol 0.8.6 (0.8.5-8-g6834aae)<br>Gemmi v0.7.5-145-g097e7656
+current version:<br>GemmiMol 0.8.6 (0.8.5-12-gc3cfb68)<br>Gemmi v0.7.5-147-g08db0610
 
 Integration notes: [integration](integration.html)

@@ -7,7 +7,7 @@
   <meta name="theme-color" content="#333333">
   <link rel="stylesheet" href="gemmimol.css">
 
-  <script src="gemmimol.js?v=symm-colors-1"></script>
+  <script src="gemmimol.js?v=cod-render-fix-1"></script>
   <script src="vendor/wasm/gemmi.js"></script>
 
 </head>
@@ -20,77 +20,33 @@
   <footer id="help"></footer>
   <div id="inset"></div>
   <script>
-    // Minimal demo: fetch a small-molecule CIF from the
-    // Crystallography Open Database (http://www.crystallography.net/cod/),
-    // parse it with gemmi.read_small_structure, convert to PDB text,
-    // and load into the viewer.
-    //
-    // COD 1542540 is Cs[NMe4][B12H12].H2O (Tiritiris & Schleid, 2016).
-    // The CIF is served from data/ because crystallography.net does not
-    // send CORS headers.
-    V = new GM.Viewer({viewer: "viewer", hud: "hud", help: "help"});
-    V.hud("loading COD 1542540...");
-
-    function padLeft(s, n) {
-      s = String(s);
-      while (s.length < n) s = ' ' + s;
-      return s;
-    }
-    function padRight(s, n) {
-      s = String(s);
-      while (s.length < n) s = s + ' ';
-      return s;
-    }
-    function pdbFloat(x, width, decimals) {
-      return padLeft(x.toFixed(decimals), width);
-    }
-
-    function smallStructureToPdb(ss) {
-      const cell = ss.cell;
-      const lines = [];
-      const sg = ss.spacegroup_hm || 'P 1';
-      lines.push('CRYST1' +
-        pdbFloat(cell.a, 9, 3) + pdbFloat(cell.b, 9, 3) + pdbFloat(cell.c, 9, 3) +
-        pdbFloat(cell.alpha, 7, 2) + pdbFloat(cell.beta, 7, 2) +
-        pdbFloat(cell.gamma, 7, 2) +
-        ' ' + padRight(sg, 11).slice(0, 11) + '   1');
-      const sites = ss.sites;
-      const n = sites.size();
-      for (let i = 0; i < n; i++) {
-        const site = sites.get(i);
-        const pos = site.orth(cell);
-        const el = (site.element_uname || 'C').toUpperCase();
-        const label = site.label.toUpperCase().replace(/[^A-Z0-9]/g, '');
-        let nameField;
-        if (el.length === 1) {
-          nameField = ' ' + padRight(label.slice(0, 3), 3);
-        } else {
-          nameField = padRight(label.slice(0, 4), 4);
-        }
-        lines.push(
-          'HETATM' + padLeft((i + 1) % 100000, 5) + ' ' + nameField +
-          ' LIG A   1    ' +
-          pdbFloat(pos[0], 8, 3) + pdbFloat(pos[1], 8, 3) + pdbFloat(pos[2], 8, 3) +
-          '  1.00  0.00          ' + padLeft(el, 2));
-        site.delete && site.delete();
-      }
-      lines.push('END');
-      return lines.join('\n');
-    }
-
+    // COD 1574457 is caffeine_3,5-dinitrobenzoic acid.
+    V = new GM.Viewer({
+      viewer: "viewer",
+      hud: "hud",
+      help: "help",
+      hydrogens: false,
+      ligand_style: "ball&stick",
+      ball_size: 0.24
+    });
+    V.hud("loading COD 1574457...");
     Gemmi().then(function (gemmi) {
-      V.load_file('data/cod_1542540.cif', {progress: true}, function (req) {
-        try {
-          const ss = gemmi.read_small_structure(req.responseText, 'cod_1542540.cif');
-          const pdbText = smallStructureToPdb(ss);
-          ss.delete();
-          V.load_model_from_text(pdbText, 'cod_1542540.pdb', gemmi).then(function () {
-            V.load_ccp4_maps('data/cod_1542540.map', 'data/cod_1542540_diff.map');
-            V.hud('COD 1542540: Cs[NMe4][B12H12].H2O');
-          });
-        } catch (e) {
-          V.hud('Error: ' + e.message, 'ERR');
+      V.load_model("1574457.mmcif", {gemmi: gemmi}, function () {
+        const bag = V.model_bags[0];
+        GM.load_maps_from_mtz(gemmi, V, "1574457_maps.mtz");
+        if (!V.has_frag_depth()) {
+          V.config.mainchain_style = "lines";
+          V.config.sidechain_style = "lines";
+          V.config.ligand_style = "lines";
+          V.config.bond_line = 6.5;
+          V.redraw_models();
         }
+        if (bag) {
+          const center = bag.model.get_center();
+          V.recenter(center, [center[0] + 55, center[1] - 35, center[2] + 70], 1);
+        }
+        V.toggle_cell_box();
+        V.hud("COD 1574457: caffeine_3,5-dinitrobenzoic acid");
       });
     });
   </script>
