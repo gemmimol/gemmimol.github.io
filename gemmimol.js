@@ -11640,11 +11640,14 @@ class Viewer {
       focus_atom.xyz :
       [this.target.x, this.target.y, this.target.z];
     const self = this;
+    const before_h = bag.model.hydrogen_count;
     return this.refresh_model_from_structure_with_bonds(bag, center, true).then(
       function () {
-        const n_h = self.current_model_hydrogen_count();
-        console.log('add_hydrogens: placed', n_h, 'H/D atoms');
-        self.hud('Hydrogens added (' + n_h + ').');
+        const after_h = self.current_model_hydrogen_count();
+        console.log('add_hydrogens: removed', before_h,
+                    'H/D atoms from input, placed', after_h);
+        self.hud('Hydrogens: removed ' + before_h +
+                 ', added ' + after_h + '.');
       },
       function (err) {
         console.error('add_hydrogens error:', err);
