@@ -44,6 +44,6 @@ or [email](mailto:wojdyr@gmail.com).
 See the [UglyMol Wiki](https://github.com/uglymol/uglymol/wiki)
 for more information.
 
-current version:<br>GemmiMol 0.8.7 (0.8.7-1-g15bf15c)<br>Gemmi v0.7.5-148-gfd9e19b6
+current version:<br>GemmiMol 0.8.7 (0.8.7-4-g3f232ca)<br>Gemmi v0.7.5-150-ga086eb38
 
 Integration notes: [integration](integration.html)

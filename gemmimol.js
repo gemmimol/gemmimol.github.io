@@ -12,8 +12,8 @@ typeof define === 'function' && define.amd ? define(['exports'], factory) :
 })(this, (function (exports) { 'use strict';
 
 var VERSION = exports.VERSION = "0.8.7";
-var GIT_DESCRIBE = exports.GIT_DESCRIBE = "0.8.7-dirty";
-var GEMMI_GIT_DESCRIBE = exports.GEMMI_GIT_DESCRIBE = "v0.7.5-148-gfd9e19b6";
+var GIT_DESCRIBE = exports.GIT_DESCRIBE = "0.8.7-4-g3f232ca-dirty";
+var GEMMI_GIT_DESCRIBE = exports.GEMMI_GIT_DESCRIBE = "v0.7.5-150-ga086eb38";
 
 
 const BondType = {
@@ -320,6 +320,7 @@ function modelsFromGemmi(gemmi, buffer, name,
       const m = new Model();
       m.source_model_index = i_model;
       m.unit_cell = copy_unit_cell(gemmi, cell);
+      m.spacegroup_hm = st.spacegroup_hm || '';
       fill_model_from_gemmi(model, m);
       finalize_model(m, bond_data, true);
       models.push(m);
@@ -356,6 +357,7 @@ function modelFromGemmiStructure(gemmi, st,
   const m = new Model();
   m.source_model_index = model_index;
   m.unit_cell = copy_unit_cell(gemmi, cell);
+  m.spacegroup_hm = st.spacegroup_hm || '';
   fill_model_from_gemmi(gm, m);
   finalize_model(m, bond_data);
   return m;
@@ -372,10 +374,12 @@ class Model {
   
   
   
+  
 
   constructor() {
     this.atoms = [];
     this.unit_cell = null;
+    this.spacegroup_hm = '';
     this.has_hydrogens = false;
     this.hydrogen_count = 0;
     this.lower_bound = [0, 0, 0];
@@ -7255,6 +7259,20 @@ class Controls {
 // Generated from CCP4/Coot monomer library CIFs.
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+const AMINO_ACID_NAMES = ["ALA","ARG","ASN","ASP","CYS","GLN","GLU","GLY","HIS","ILE","LEU","LYS","MET","PHE","PRO","SER","THR","TRP","TYR","VAL"] ;
+
 const AMINO_ACID_TEMPLATES = {
   "ALA": {
     name: "ALA",
@@ -7761,6 +7779,8 @@ const AMINO_ACID_TEMPLATES = {
     ],
   },
 };
+
+const NUCLEOTIDE_TEMPLATE_NAMES = ["A", "C", "G", "U", "DA", "DC", "DG", "DT"] ;
 
 const NUCLEOTIDE_TEMPLATES = {
   "A": {
@@ -8459,6 +8479,10 @@ function plan_residue_mutation(residue_atoms, target_resname) {
 }
 
 function _nullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return rhsFn(); } } function _optionalChain(ops) { let lastAccessLHS = undefined; let value = ops[0]; let i = 1; while (i < ops.length) { const op = ops[i]; const fn = ops[i + 1]; i += 2; if ((op === 'optionalAccess' || op === 'optionalCall') && value == null) { return undefined; } if (op === 'access' || op === 'optionalAccess') { lastAccessLHS = value; value = fn(value); } else if (op === 'call' || op === 'optionalCall') { value = fn((...args) => value.call(lastAccessLHS, ...args)); lastAccessLHS = undefined; } } return value; }
+const STANDARD_RESNAMES = new Set([
+  ...AMINO_ACID_NAMES, ...NUCLEOTIDE_TEMPLATE_NAMES, 'HOH',
+]);
+
 
 
 
@@ -8673,6 +8697,11 @@ function help_action_attrs(spec) {
 function help_action_link(text, spec) {
   return '<a href="#" class="gm-help-action"' + help_action_attrs(spec) + '>' +
          escape_html(text) + '</a>';
+}
+
+function help_method_link(text, method) {
+  return '<a href="#" class="gm-help-action" data-help-action="' +
+         escape_html(method) + '">' + escape_html(text) + '</a>';
 }
 
 function normalize_viewer_options(options) {
@@ -9390,6 +9419,9 @@ class Viewer {
   
   
   
+  
+  
+  
 
   constructor(options = {}) {
     options = normalize_viewer_options(options);
@@ -9502,6 +9534,7 @@ class Viewer {
     this.place_select_el = null;
     this.metals_select_el = null;
     this.ligands_select_el = null;
+    this.nonstd_select_el = null;
     this.sites_select_el = null;
     this.connections_select_el = null;
     this.download_select_el = null;
@@ -9518,6 +9551,8 @@ class Viewer {
     this.queued_mutation_preview = null;
     this.histogram_el = null;
     this.histogram_redraw = null;
+    this.reflection_histogram = null;
+    this.reflection_histogram_el = null;
     this.sphere_scale_el = null;
     this.blob_hits = [];
     this.blob_map_bag = null;
@@ -9705,13 +9740,27 @@ class Viewer {
     const el = this.structure_name_el;
     if (!el) return;
     const text = (name || '').trim();
-    if (text !== '') {
-      el.textContent = text.toUpperCase();
-      el.style.display = 'block';
-    } else {
+    const bag = this.selected.bag || this.model_bags[0];
+    const sg = (bag && bag.model && bag.model.spacegroup_hm) || '';
+    if (text === '' && sg === '') {
       el.textContent = '';
       el.style.display = 'none';
+      return;
     }
+    if (sg === '') {
+      el.textContent = text.toUpperCase();
+    } else {
+      el.innerHTML = '';
+      if (text !== '') {
+        const title = document.createElement('div');
+        title.textContent = text.toUpperCase();
+        el.appendChild(title);
+      }
+      const sub = document.createElement('div');
+      sub.textContent = sg;
+      el.appendChild(sub);
+    }
+    el.style.display = 'block';
   }
 
   pick_atom(coords, camera) {
@@ -10785,6 +10834,7 @@ class Viewer {
     this.place_select_el = this.create_place_select();
     this.metals_select_el = this.create_nav_select();
     this.ligands_select_el = this.create_nav_select();
+    this.nonstd_select_el = this.create_nav_select();
     this.sites_select_el = this.create_site_select();
     this.connections_select_el = this.create_connection_select();
     this.empty_blobs_select_el = this.create_empty_blobs_select();
@@ -10795,6 +10845,7 @@ class Viewer {
     row1.appendChild(this.place_select_el);
     row1.appendChild(this.metals_select_el);
     row1.appendChild(this.ligands_select_el);
+    row1.appendChild(this.nonstd_select_el);
     row1.appendChild(this.sites_select_el);
     row1.appendChild(this.connections_select_el);
     row1.appendChild(this.empty_blobs_select_el);
@@ -10812,12 +10863,16 @@ class Viewer {
     const metal_items = bag ? this.collect_nav_items(bag, (atom) => atom.is_metal) : [];
     const ligand_items = bag ? this.collect_nav_items(
       bag, (atom) => atom.is_ligand && !atom.is_metal && !atom.is_water()) : [];
+    const nonstd_items = bag ? this.collect_nav_items(
+      bag, (atom) => !atom.is_ligand && !atom.is_metal && !atom.is_water() &&
+                     !STANDARD_RESNAMES.has((atom.resname || '').toUpperCase())) : [];
     const site_items = bag ? this.collect_site_nav_items(bag) : [];
     const connection_items = bag ? this.collect_connection_nav_items(bag) : [];
     this.update_blob_select(this.blob_select_el);
     this.update_place_select(this.place_select_el);
     this.update_nav_select(this.metals_select_el, 'Metals', bag, metal_items);
     this.update_nav_select(this.ligands_select_el, 'Ligands', bag, ligand_items);
+    this.update_nav_select(this.nonstd_select_el, 'Non-std residues', bag, nonstd_items);
     this.update_site_select(this.sites_select_el, bag, site_items);
     this.update_connection_select(this.connections_select_el, bag, connection_items);
     this.update_empty_blobs_select(this.empty_blobs_select_el);
@@ -12217,6 +12272,99 @@ class Viewer {
     }
   }
 
+  toggle_reflection_histogram() {
+    if (this.reflection_histogram_el) {
+      this.reflection_histogram_el.remove();
+      this.reflection_histogram_el = null;
+      return;
+    }
+    const hist = this.reflection_histogram;
+    if (!hist) {
+      this.hud('No MTZ reflections loaded.', 'ERR');
+      return;
+    }
+    const nbins = hist.observed.length;
+    const width = 360, height = 180, pad_l = 34, pad_r = 8, pad_t = 8, pad_b = 22;
+    const plot_w = width - pad_l - pad_r;
+    const plot_h = height - pad_t - pad_b;
+    let ymax = 0;
+    for (let i = 0; i < nbins; i++) {
+      const v = hist.observed[i] + hist.missing[i];
+      if (v > ymax) ymax = v;
+    }
+    if (ymax === 0) ymax = 1;
+    const d_low = hist.d_bounds[0];
+    const d_high = hist.d_bounds[nbins];
+    const bw = plot_w / nbins;
+    const bar_svg = [];
+    for (let i = 0; i < nbins; i++) {
+      const obs = hist.observed[i];
+      const miss = hist.missing[i];
+      const total = obs + miss;
+      const x = pad_l + i * bw;
+      const total_h = total / ymax * plot_h;
+      const obs_h = obs / ymax * plot_h;
+      const y_total = pad_t + plot_h - total_h;
+      const y_obs = pad_t + plot_h - obs_h;
+      if (total > 0) {
+        bar_svg.push(
+          '<rect x="' + x + '" y="' + y_total +
+          '" width="' + (bw - 1) + '" height="' + total_h +
+          '" fill="#c94c4c"/>'
+        );
+      }
+      if (obs > 0) {
+        bar_svg.push(
+          '<rect x="' + x + '" y="' + y_obs +
+          '" width="' + (bw - 1) + '" height="' + obs_h +
+          '" fill="#4aa564"/>'
+        );
+      }
+    }
+    const title = hist.label ?
+      'reflections by resolution (green = ' + hist.label +
+      ' present, red = missing)' :
+      'reflections by resolution';
+    const wrapper = document.createElement('div');
+    wrapper.className = 'gm-reflection-histogram';
+    wrapper.style.position = 'absolute';
+    wrapper.style.right = '10px';
+    wrapper.style.bottom = '10px';
+    wrapper.style.background = 'rgba(0,0,0,0.75)';
+    wrapper.style.color = '#ddd';
+    wrapper.style.padding = '6px 8px';
+    wrapper.style.font = '11px sans-serif';
+    wrapper.style.pointerEvents = 'auto';
+    wrapper.innerHTML =
+      '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:2px">' +
+      '<span>' + title + '</span>' +
+      '<a href="#" class="gm-help-action" data-help-action="toggle_reflection_histogram" ' +
+      'style="color:#9cf;margin-left:12px">close</a></div>' +
+      '<svg width="' + width + '" height="' + height + '" xmlns="http://www.w3.org/2000/svg">' +
+      '<line x1="' + pad_l + '" y1="' + (pad_t + plot_h) +
+      '" x2="' + (pad_l + plot_w) + '" y2="' + (pad_t + plot_h) +
+      '" stroke="#888"/>' +
+      '<line x1="' + pad_l + '" y1="' + pad_t +
+      '" x2="' + pad_l + '" y2="' + (pad_t + plot_h) + '" stroke="#888"/>' +
+      bar_svg.join('') +
+      '<text x="' + pad_l + '" y="' + (height - 6) +
+      '" fill="#ccc">' + d_low.toFixed(2) + ' Å</text>' +
+      '<text x="' + (pad_l + plot_w) + '" y="' + (height - 6) +
+      '" text-anchor="end" fill="#ccc">' + d_high.toFixed(2) + ' Å</text>' +
+      '<text x="4" y="' + (pad_t + 10) + '" fill="#ccc">' + ymax + '</text>' +
+      '</svg>';
+    const parent = this.viewer_overlay_el || document.body;
+    parent.appendChild(wrapper);
+    const close = wrapper.querySelector('.gm-help-action') ;
+    if (close) {
+      close.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        this.toggle_reflection_histogram();
+      });
+    }
+    this.reflection_histogram_el = wrapper;
+  }
+
   toggle_histogram() {
     if (this.histogram_el) {
       this.histogram_el.remove();
@@ -12501,7 +12649,17 @@ class Viewer {
   update_help() {
     const el = this.help_el;
     if (!el) return;
-    el.innerHTML = [this.MOUSE_HELP, this.KEYBOARD_HELP,
+    const uc = this.selected.bag ? this.selected.bag.model.unit_cell : null;
+    const cell_line = uc ?
+      '<span style="margin-left:2em;color:#aaa">' +
+      uc.a.toFixed(2) + ' ' + uc.b.toFixed(2) + ' ' + uc.c.toFixed(2) + ' Å, ' +
+      uc.alpha.toFixed(1) + ' ' + uc.beta.toFixed(1) + ' ' + uc.gamma.toFixed(1) +
+      '°</span>' : '';
+    const kb = this.KEYBOARD_HELP.replace(
+      /(>U = unitcell box<\/a>)/,
+      '$1' + (cell_line ? '\n' + cell_line : '')
+    );
+    el.innerHTML = [this.MOUSE_HELP, kb,
                     this.ABOUT_HELP, this.fps_text].join('\n\n');
   }
 
@@ -12517,6 +12675,14 @@ class Viewer {
   on_help_click(event) {
     let el = event.target ;
     while (el && el !== this.help_el) {
+      const action = el.getAttribute('data-help-action');
+      if (action != null) {
+        event.preventDefault();
+        event.stopPropagation();
+        const fn = (this )[action];
+        if (typeof fn === 'function') fn.call(this);
+        return;
+      }
       const keycode = el.getAttribute('data-help-keycode');
       if (keycode != null) {
         event.preventDefault();
@@ -13780,6 +13946,7 @@ Viewer.prototype.KEYBOARD_HELP = [
   help_action_link('V = inactive models', {keyCode: 86}),
   help_action_link('R = center view', {keyCode: 82}),
   help_action_link('G = density histogram', {keyCode: 71}),
+  help_method_link('reflection histogram (by resolution)', 'toggle_reflection_histogram'),
   help_action_link('W = density style', {keyCode: 87}),
   help_action_link('I = spin', {keyCode: 73}),
   help_action_link('K = rock', {keyCode: 75}),
@@ -14357,8 +14524,47 @@ ReciprocalViewer.prototype.MOUSE_HELP =
 
 ReciprocalViewer.prototype.ColorSchemes = ColorSchemes;
 
+const OBSERVED_LABEL_CANDIDATES = [
+  'F_meas_au', 'F_meas', 'F_est', 'FP', 'F', 'FOBS',
+  'I', 'IMEAN', 'IOBS', 'I-obs',
+];
+
 function log_timing(t0, text) {
   console.log(text + ': ' + (performance.now() - t0).toFixed(2) + ' ms.');
+}
+
+function make_histogram(mtz, label,
+                        nbins) {
+  const d_bounds = new Array(nbins + 1);
+  const buf = mtz.resolution_histogram(label || '', nbins, d_bounds);
+  if (!buf) return null;
+  // wasm returns a typed_memory_view into wasm memory; slice to detach.
+  const flat = new Uint32Array(buf).slice();
+  return {
+    d_bounds: d_bounds.slice(),
+    observed: flat.slice(0, nbins),
+    missing: flat.slice(nbins, 2 * nbins),
+    label: label,
+  };
+}
+
+function has_missing_reflections(hist) {
+  for (let i = 0; i < hist.missing.length; i++) {
+    if (hist.missing[i] > 0) return true;
+  }
+  return false;
+}
+
+function compute_histogram(mtz, nbins) {
+  // resolution_histogram() currently treats unknown non-empty labels as
+  // "all observed", so use only labels that expose actual missing values.
+  for (const label of OBSERVED_LABEL_CANDIDATES) {
+    try {
+      const hist = make_histogram(mtz, label, nbins);
+      if (hist && has_missing_reflections(hist)) return hist;
+    } catch (e2) { /* ignore */ }
+  }
+  return make_histogram(mtz, null, nbins);
 }
 
 function add_map_from_mtz(gemmi, viewer,
@@ -14375,6 +14581,12 @@ function add_map_from_mtz(gemmi, viewer,
 
 function load_maps_from_mtz_buffer(gemmi, viewer, mtz,
                                    labels) {
+  try {
+    const hist = compute_histogram(mtz, 25);
+    if (hist) viewer.reflection_histogram = hist;
+  } catch (e) {
+    console.warn('reflection histogram failed:', e);
+  }
   if (labels != null) {
     for (let n = 0; n < labels.length; n += 2) {
       if (labels[n] === '') continue;
@@ -14493,6 +14705,7 @@ exports.fog_end_fragment = fog_end_fragment;
 exports.fog_pars_fragment = fog_pars_fragment;
 exports.getVdwRadius = getVdwRadius;
 exports.help_action_link = help_action_link;
+exports.help_method_link = help_method_link;
 exports.load_maps_from_mtz = load_maps_from_mtz;
 exports.load_maps_from_mtz_buffer = load_maps_from_mtz_buffer;
 exports.makeBalls = makeBalls;
