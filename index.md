@@ -16,7 +16,7 @@ For instance, when screening
 Of course, for this to work, it needs to be integrated into a website
 that provides the data access
 (see the [UglyMol FAQ](https://github.com/uglymol/uglymol/wiki) on how to do it).
-See also the [integration page](integration.html) for GemmiMol-specific notes,
+See also the [integration page](integration.html) for notes,
 including how to provide monomer CIF files.
 
 Try it:
@@ -44,6 +44,6 @@ or [email](mailto:wojdyr@gmail.com).
 See the [UglyMol Wiki](https://github.com/uglymol/uglymol/wiki)
 for more information.
 
-current version:<br>GemmiMol 0.8.7 (0.8.7-4-g3f232ca)<br>Gemmi v0.7.5-150-ga086eb38
+current version:<br>GemmiMol 0.8.8 (0.8.8)<br>Gemmi v0.7.5-152-g4bf01c29
 
 Integration notes: [integration](integration.html)
